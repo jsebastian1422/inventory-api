@@ -1,0 +1,36 @@
+{
+  "name": "inventory-api",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "test": "vitest run",
+    "start:core": "npm run start -w @inventory/core",
+    "dev:core": "npm run dev -w @inventory/core",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "migrate:up": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js up -f migrate.config.cjs",
+    "migrate:down": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js down -f migrate.config.cjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "eslint": "^10.13.0",
+    "eslint-config-prettier": "^10.1.8",
+    "node-pg-migrate": "^9.0.0",
+    "prettier": "^3.9.10",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.0",
+    "vitest": "^5.0.5"
+  }
+}
