@@ -23,3 +23,13 @@ export function hasAllPermissions(
   const set = new Set(granted);
   return required.every((code) => set.has(code));
 }
+
+/** Permissions of the establishments module (services/core). Added to the catalog by migration. */
+export const ESTABLISHMENT_PERMISSIONS = [
+  'establishments.read',
+  'establishments.create',
+  'establishments.update',
+  'establishments.deactivate',
+] as const;
+
+export type EstablishmentPermission = (typeof ESTABLISHMENT_PERMISSIONS)[number];

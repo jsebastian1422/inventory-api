@@ -3,3 +3,4 @@ export type ServiceName = string;
 
 export * from './auth/permissions.js';
 export * from './auth/access-token.js';
+export * from './auth/user-access.js';
