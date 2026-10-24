@@ -13,13 +13,17 @@
     "build": "npm run build --workspaces --if-present",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "test": "vitest run",
+    "test": "node --env-file-if-exists=.env node_modules/vitest/vitest.mjs run",
     "start:core": "npm run start -w @inventory/core",
     "dev:core": "npm run dev -w @inventory/core",
+    "start:identity": "npm run start -w @inventory/identity",
+    "dev:identity": "npm run dev -w @inventory/identity",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
-    "migrate:up": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js up -f migrate.config.cjs",
-    "migrate:down": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js down -f migrate.config.cjs"
+    "migrate:up": "node --env-file-if-exists=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js up -f migrate.config.cjs",
+    "migrate:down": "node --env-file-if-exists=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js down -f migrate.config.cjs",
+    "keys:generate": "node scripts/generate-keys.mjs",
+    "identity:create-admin": "npm run create-admin -w @inventory/identity"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

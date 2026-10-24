@@ -7,7 +7,10 @@ import { AppModule } from './infrastructure/http/app.module.js';
 async function bootstrap(): Promise<void> {
   // Validate configuration first: fail fast with a clear message.
   const config = loadConfig();
-  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule.register(config),
+    new FastifyAdapter(),
+  );
   app.enableShutdownHooks();
   await app.listen(config.API_PORT, config.API_HOST);
 }
