@@ -72,21 +72,24 @@ npm run migrate:down   # revierte la ultima
 
 Leen `.env` si existe; sin `.env` funcionan igual si las variables `POSTGRES_*` estan en el entorno.
 
-Migraciones actuales (6):
+Migraciones actuales (9):
 
-| Migracion                    | Contenido                                                                              | `migrate:down` que la revierten |
-| ---------------------------- | -------------------------------------------------------------------------------------- | ------------------------------- |
-| `identity-tables`            | roles, permissions, role_permissions, users, refresh_tokens                            | identity: 2 en total            |
-| `identity-seed`              | permisos de usuarios/roles y rol de sistema "Administrador" con todos ellos            | (ver arriba)                    |
-| `establishments`             | tabla `establishments` (nombre unico sin distinguir mayusculas, checks de coordenadas) | establecimientos: 2 en total    |
-| `establishments-permissions` | permisos `establishments.*` asignados al rol Administrador                             | (ver arriba)                    |
-| `establishments-sync`        | columnas `version` y `change_xid` e indice del feed de cambios en `establishments`     | sincronizacion: 2 en total      |
-| `idempotency-keys`           | tabla `idempotency_keys` (claves de idempotencia por usuario)                          | (ver arriba)                    |
+| Migracion                       | Contenido                                                                              | `migrate:down` que la revierten |
+| ------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------- |
+| `identity-tables`               | roles, permissions, role_permissions, users, refresh_tokens                            | identity: 2 en total            |
+| `identity-seed`                 | permisos de usuarios/roles y rol de sistema "Administrador" con todos ellos            | (ver arriba)                    |
+| `establishments`                | tabla `establishments` (nombre unico sin distinguir mayusculas, checks de coordenadas) | establecimientos: 2 en total    |
+| `establishments-permissions`    | permisos `establishments.*` asignados al rol Administrador                             | (ver arriba)                    |
+| `establishments-sync`           | columnas `version` y `change_xid` e indice del feed de cambios en `establishments`     | sincronizacion: 2 en total      |
+| `idempotency-keys`              | tabla `idempotency_keys` (claves de idempotencia por usuario)                          | (ver arriba)                    |
+| `catalog`                       | tablas `categories`, `products` y `product_price_history`                              | catalogo: 3 en total            |
+| `inventories`                   | tablas `inventories`, `inventory_lines` e `inventory_line_history`                     | (ver arriba)                    |
+| `catalog-inventory-permissions` | 12 permisos `categories.*`, `products.*` e `inventories.*` asignados al Administrador  | (ver arriba)                    |
 
 `migrate:down` revierte de una en una, en orden inverso. Cuantas hacen falta por modulo: sincronizacion 2
 (`idempotency-keys`, luego `establishments-sync`), establecimientos 2 (`establishments-permissions`, luego
-`establishments`) e identity 2 (`identity-seed`, luego `identity-tables`); para volver a la BD vacia hacen
-falta 6. Revertir la semilla de identity falla si ya hay usuarios con el rol Administrador (la FK lo impide).
+`establishments`) e identity 2 (`identity-seed`, luego `identity-tables`); el catalogo y los inventarios 3 (`catalog-inventory-permissions`, `inventories`, luego `catalog`); para volver a
+la BD vacia hacen falta 9. Revertir la semilla de identity falla si ya hay usuarios con el rol Administrador (la FK lo impide).
 
 Las migraciones cuyo `down` contiene `DROP` (todas las que eliminan tablas, columnas o indices) las aplica
 una persona, no los agentes: el hook de politica del proyecto bloquea esos comandos.
@@ -203,6 +206,69 @@ cliente que no envia `Idempotency-Key`, `If-Match` ni `id` se comporta como ante
 - **identity solo en linea**: login, refresh, logout, sesiones, usuarios, roles y permisos **no deben
   encolarse offline**. identity no adopta el protocolo (ignora `Idempotency-Key` e `If-Match`); solo
   habilita CORS con `CORS_ORIGINS`.
+
+## Core: categorias, productos e inventarios
+
+Mismos permisos en vivo (ADR-0001) y mismo protocolo offline (ADR-0002) que Establecimientos. Todos los
+listados aceptan `limit` 1-200 (def. 50), `offset` y `status=active|inactive|all` (def. `all`) y responden
+`{ items, total, limit, offset }`; los feeds responden `{ items, nextCursor, hasMore }`. No hay borrado fisico:
+todo se activa/desactiva con `PATCH /<recurso>/:id/status` (`{"isActive": bool}`).
+
+| Metodo y ruta                                                                  | Permiso                                                          |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| `POST/GET /categories`, `GET /categories/changes`, `GET/PATCH /categories/:id` | `categories.create` / `read` / `read` / `read` / `update`        |
+| `PATCH /categories/:id/status`                                                 | `categories.deactivate`                                          |
+| `POST/GET /products` (`q`, `categoryId`), `GET /products/changes`              | `products.create` / `read`                                       |
+| `GET/PATCH /products/:id`, `PATCH /products/:id/status`                        | `products.read` / `update` / `deactivate`                        |
+| `GET /products/:id/price-history`                                              | `products.read`                                                  |
+| `POST/GET /inventories` (`establishmentId`, `q`), `GET /inventories/changes`   | `inventories.create` / `read`                                    |
+| `GET/PATCH /inventories/:id`, `PATCH /inventories/:id/status`                  | `inventories.read` / `update` / `deactivate`                     |
+| `POST /inventories/:id/lines`, `GET /inventories/:id/lines`                    | `inventories.update` / `read` (`productId`, `barcode`, `status`) |
+| `GET /inventory-lines/changes`, `GET /inventory-lines/:id`                     | `inventories.read`                                               |
+| `PATCH /inventory-lines/:id`, `PATCH /inventory-lines/:id/status`              | `inventories.update` / `deactivate`                              |
+| `GET /inventory-lines/:id/history`                                             | `inventories.read`                                               |
+
+Campos:
+
+- Categoria: `code` (max 30, `A-Z 0-9 -`, se guarda en mayusculas, unico), `name` (100, unico sin distinguir
+  mayusculas), `description` (opcional, 500).
+- Producto: `sku` (50, en mayusculas, unico sin distinguir mayusculas), `name` (150), `description` (1000),
+  `brand` (100), `unit` (`unit`, `meter`, `kilogram`, `liter`, `box`, `package`), `categoryId` (activa) y
+  `price`.
+- Inventario: `establishmentId` (activo), `name` (150), `startDate`/`endDate` (`YYYY-MM-DD`, final >= inicial,
+  se permiten periodos superpuestos), `origin` (255), `notes` (opcional, 1000).
+- Linea: `productId` (activo, fijo al crear), `barcode` (64), `expiresOn` (opcional), `quantityInitial`,
+  `quantityAlert` y `quantityCurrent` (calculada; enviarla es 400). Unico por inventario:
+  `barcode` + `expiresOn` (el vencimiento nulo cuenta como un valor).
+
+**Decimales (ADR-0003)**: `price` (maximo 12 enteros y 2 decimales) y las cantidades (11 enteros y 3 decimales)
+viajan como **texto** (`"12500.00"`, `"10.500"`); se rechazan numeros JSON, negativos, exponentes y separadores
+de miles. La respuesta siempre trae la escala fija. En el cliente no los conviertas a `number` al calcular.
+
+**Cantidades**: al crear, `quantityCurrent = quantityInitial`. Editar `quantityInitial` mueve la actual en la
+misma diferencia; si quedaria negativa, 409 `QUANTITY_BELOW_ZERO` y no cambia nada.
+
+**Historicos** (solo lectura, mas reciente primero, `limit`/`offset`, sin feed): precios en
+`GET /products/:id/price-history` (`oldPrice` null en el precio inicial, `newPrice`, `actorId`, `changedAt`) y
+cantidades en `GET /inventory-lines/:id/history` (`reason` `created` o `initial_adjusted`, `initialBefore/After`,
+`currentBefore/After`, `delta`, `actorId`, `changedAt`). Se escriben en la misma transaccion que el cambio.
+
+**Dependencias activas (409)**: `CATEGORY_HAS_ACTIVE_PRODUCTS` (desactivar categoria con productos activos),
+`PRODUCT_IN_ACTIVE_INVENTORY` (desactivar producto en una linea activa de un inventario activo),
+`CATEGORY_INACTIVE`, `PRODUCT_INACTIVE`, `INVENTORY_INACTIVE` y `ESTABLISHMENT_INACTIVE` (crear, editar o activar
+con un padre inactivo; desactivar una linea siempre se permite). Referencia inexistente: 404.
+
+Activar un inventario (`PATCH /inventories/:id/status` con `isActive: true`) se bloquea con 409 si su establecimiento
+esta inactivo (`ESTABLISHMENT_INACTIVE`) y, despues, si tiene lineas activas con productos inactivos
+(`INVENTORY_HAS_INACTIVE_PRODUCTS`; `details` lista `{lineId, productId}`). No cambia nada: reactiva el establecimiento
+o los productos, o desactiva esas lineas, y reintenta.
+
+Otros 409: `CATEGORY_CODE_TAKEN`, `CATEGORY_NAME_TAKEN`, `PRODUCT_SKU_TAKEN`, `INVENTORY_LINE_DUPLICATE`,
+`CATEGORY_ID_TAKEN`, `PRODUCT_ID_TAKEN`, `INVENTORY_ID_TAKEN`, `INVENTORY_LINE_ID_TAKEN` y `VERSION_CONFLICT`.
+Orden de errores al editar: 400, 404, `VERSION_CONFLICT`, reglas de negocio, unicidad (en `PATCH /inventories/:id`, el
+400 por orden de fechas cuando solo llega una de ellas se evalua contra la fecha guardada, por eso va despues del 404 y
+del `VERSION_CONFLICT`). Los POST y PATCH aceptan
+`Idempotency-Key`, los PATCH `If-Match` y los POST un `id` de cliente, como en Establecimientos.
 
 ## Calidad
 

@@ -165,6 +165,10 @@ beforeAll(async () => {
     database: testDb,
   });
   // Clean slate in the TEST database only.
+  // Inventories (sprint 005) reference establishments with RESTRICT: clear them first.
+  await pool.query('DELETE FROM inventory_line_history');
+  await pool.query('DELETE FROM inventory_lines');
+  await pool.query('DELETE FROM inventories');
   await pool.query('DELETE FROM establishments');
   app = await boot(config, logs);
   admin = await actor(ALL);
@@ -702,6 +706,35 @@ async function drain(cursor?: string, limit = 3) {
   throw new Error('feed does not terminate');
 }
 
+/** Wait for the feed to show what was written (ADR-0002: another open write transaction in the cluster delays it). */
+const FEED_WAIT_MS = 60_000;
+/** Vitest timeout for the tests that wait on the feed; above `FEED_WAIT_MS` so the clear message wins. */
+const FEED_TEST_TIMEOUT_MS = 90_000;
+
+/** Re-reads with `read` every 250 ms until `ready` accepts the result; fails with a clear message at the deadline. */
+async function eventually<T>(what: string, read: () => Promise<T>, ready: (v: T) => boolean) {
+  const deadline = Date.now() + FEED_WAIT_MS;
+  for (;;) {
+    const value = await read();
+    if (ready(value)) return value;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `the feed did not show ${what} within ${FEED_WAIT_MS / 1000} s ` +
+          '(is another write transaction open in the PostgreSQL cluster? ADR-0002)',
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+/** `drain` repeated until the feed from `cursor` contains every id in `ids`. */
+const drainUntilSeen = (ids: string[], cursor?: string, limit = 3) =>
+  eventually(
+    `${ids.length} expected change(s)`,
+    () => drain(cursor, limit),
+    (r) => ids.every((id) => r.items.some((e) => e.id === id)),
+  );
+
 describe('S4 versions and client ids (CA-2, CA-3)', () => {
   it('CA-2: every representation has version; create 1, +1 per effective change, same status keeps it', async () => {
     const created = await createSede();
@@ -1188,103 +1221,134 @@ describe('S4 If-Match (CA-8 to CA-10, CA-15)', () => {
 });
 
 describe('S4 change feed (CA-11 to CA-14)', () => {
-  it('CA-11: without cursor returns every establishment (active and inactive) without repeats or gaps', async () => {
-    for (let i = 0; i < 4; i++) await createSede();
-    const off = await createSede();
-    await call('PATCH', `/establishments/${off.id}/status`, {
-      token: admin.token,
-      body: { isActive: false },
-    });
-    const { items } = await drain(undefined, 3);
-    const ids = items.map((e) => e.id);
-    expect(new Set(ids).size).toBe(ids.length);
-    const all = await pool.query<{ id: string }>('SELECT id FROM establishments');
-    expect([...ids].sort()).toEqual(all.rows.map((r) => r.id).sort());
-    expect(items.find((e) => e.id === off.id)?.isActive).toBe(false);
-
-    const page = await call('GET', '/establishments/changes?limit=2', { token: admin.token });
-    expect(page.status).toBe(200);
-    expect(Object.keys(page.body).sort()).toEqual(['hasMore', 'items', 'nextCursor']);
-    expect(page.body.items).toHaveLength(2);
-    expect(page.body.hasMore).toBe(true);
-    expect(typeof page.body.nextCursor).toBe('string');
-  });
-
-  it('CA-12: from a cursor returns exactly what was created, edited, activated or deactivated after', async () => {
-    const a = await createSede();
-    const b = await createSede();
-    const { cursor } = await drain();
-    expect(cursor).toBeTruthy();
-    const idle = await call('GET', `/establishments/changes?cursor=${cursor}`, {
-      token: admin.token,
-    });
-    expect(idle.body).toEqual({ items: [], nextCursor: cursor, hasMore: false });
-
-    const c = await createSede();
-    await call('PATCH', `/establishments/${a.id}`, {
-      token: admin.token,
-      body: { city: 'Leticia' },
-    });
-    await call('PATCH', `/establishments/${b.id}/status`, {
-      token: admin.token,
-      body: { isActive: false },
-    });
-    const { items, cursor: end } = await drain(cursor);
-    expect(items.map((e) => e.id).sort()).toEqual([a.id, b.id, c.id].sort());
-    expect(items.find((e) => e.id === a.id)?.city).toBe('Leticia');
-    expect(items.find((e) => e.id === b.id)?.isActive).toBe(false);
-    expect((await drain(end)).items).toEqual([]);
-  });
-
-  it('CA-12: an idempotent replay or a conflict does not produce feed entries', async () => {
-    const a = await createSede();
-    const { cursor } = await drain();
-    await call('PATCH', `/establishments/${a.id}`, {
-      token: admin.token,
-      body: { city: 'X' },
-      headers: { 'If-Match': '"9"' },
-    });
-    await call('PATCH', `/establishments/${a.id}/status`, {
-      token: admin.token,
-      body: { isActive: true },
-    });
-    expect((await drain(cursor)).items).toEqual([]);
-  });
-
-  it('CA-13: a change in a transaction still open while reading is not lost: it shows up later', async () => {
-    const open = await createSede();
-    const { cursor: start } = await drain();
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `UPDATE establishments SET city = 'Pendiente', version = version + 1,
-           change_xid = pg_current_xact_id() WHERE id = $1`,
-        [open.id],
+  it(
+    'CA-11: without cursor returns every establishment (active and inactive) without repeats or gaps',
+    async () => {
+      for (let i = 0; i < 4; i++) await createSede();
+      const off = await createSede();
+      await call('PATCH', `/establishments/${off.id}/status`, {
+        token: admin.token,
+        body: { isActive: false },
+      });
+      const all = await pool.query<{ id: string }>('SELECT id FROM establishments');
+      const { items } = await eventually(
+        'every establishment',
+        () => drain(undefined, 3),
+        (r) => all.rows.every((row) => r.items.some((e) => e.id === row.id)),
       );
-      // A later transaction commits while the first one is still open.
-      const later = await createSede();
+      const ids = items.map((e) => e.id);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect([...ids].sort()).toEqual(all.rows.map((r) => r.id).sort());
+      expect(items.find((e) => e.id === off.id)?.isActive).toBe(false);
 
-      const during = await call('GET', `/establishments/changes?cursor=${start}`, {
+      const page = await eventually(
+        'a full first page',
+        () => call('GET', '/establishments/changes?limit=2', { token: admin.token }),
+        (r) => r.status !== 200 || (r.body.items as Sede[]).length === 2,
+      );
+      expect(page.status).toBe(200);
+      expect(Object.keys(page.body).sort()).toEqual(['hasMore', 'items', 'nextCursor']);
+      expect(page.body.items).toHaveLength(2);
+      expect(page.body.hasMore).toBe(true);
+      expect(typeof page.body.nextCursor).toBe('string');
+    },
+    FEED_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'CA-12: from a cursor returns exactly what was created, edited, activated or deactivated after',
+    async () => {
+      const a = await createSede();
+      const b = await createSede();
+      const { cursor } = await drainUntilSeen([a.id, b.id]);
+      expect(cursor).toBeTruthy();
+      const idle = await call('GET', `/establishments/changes?cursor=${cursor}`, {
         token: admin.token,
       });
-      expect(during.status).toBe(200);
-      const seen = (during.body.items as Sede[]).map((e) => e.id);
-      expect(seen).not.toContain(open.id);
-      expect(seen).not.toContain(later.id);
-      expect(during.body.nextCursor).toBe(start);
+      expect(idle.body).toEqual({ items: [], nextCursor: cursor, hasMore: false });
 
-      await client.query('COMMIT');
-      const { items } = await drain(during.body.nextCursor);
-      const ids = items.map((e) => e.id);
-      expect(ids).toContain(open.id);
-      expect(ids).toContain(later.id);
-      expect(items.find((e) => e.id === open.id)?.city).toBe('Pendiente');
-    } finally {
-      await client.query('ROLLBACK').catch(() => undefined);
-      client.release();
-    }
-  });
+      const c = await createSede();
+      await call('PATCH', `/establishments/${a.id}`, {
+        token: admin.token,
+        body: { city: 'Leticia' },
+      });
+      await call('PATCH', `/establishments/${b.id}/status`, {
+        token: admin.token,
+        body: { isActive: false },
+      });
+      const { items, cursor: end } = await eventually(
+        'the created, edited and deactivated establishments',
+        () => drain(cursor),
+        (r) =>
+          [a.id, b.id, c.id].every((id) => r.items.some((e) => e.id === id)) &&
+          r.items.find((e) => e.id === a.id)?.city === 'Leticia' &&
+          r.items.find((e) => e.id === b.id)?.isActive === false,
+      );
+      expect(items.map((e) => e.id).sort()).toEqual([a.id, b.id, c.id].sort());
+      expect(items.find((e) => e.id === a.id)?.city).toBe('Leticia');
+      expect(items.find((e) => e.id === b.id)?.isActive).toBe(false);
+      expect((await drain(end)).items).toEqual([]);
+    },
+    FEED_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'CA-12: an idempotent replay or a conflict does not produce feed entries',
+    async () => {
+      const a = await createSede();
+      const { cursor } = await drainUntilSeen([a.id]);
+      await call('PATCH', `/establishments/${a.id}`, {
+        token: admin.token,
+        body: { city: 'X' },
+        headers: { 'If-Match': '"9"' },
+      });
+      await call('PATCH', `/establishments/${a.id}/status`, {
+        token: admin.token,
+        body: { isActive: true },
+      });
+      expect((await drain(cursor)).items).toEqual([]);
+    },
+    FEED_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'CA-13: a change in a transaction still open while reading is not lost: it shows up later',
+    async () => {
+      const open = await createSede();
+      const { cursor: start } = await drainUntilSeen([open.id]);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `UPDATE establishments SET city = 'Pendiente', version = version + 1,
+           change_xid = pg_current_xact_id() WHERE id = $1`,
+          [open.id],
+        );
+        // A later transaction commits while the first one is still open.
+        const later = await createSede();
+
+        const during = await call('GET', `/establishments/changes?cursor=${start}`, {
+          token: admin.token,
+        });
+        expect(during.status).toBe(200);
+        const seen = (during.body.items as Sede[]).map((e) => e.id);
+        expect(seen).not.toContain(open.id);
+        expect(seen).not.toContain(later.id);
+        expect(during.body.nextCursor).toBe(start);
+
+        await client.query('COMMIT');
+        const { items } = await drainUntilSeen([open.id, later.id], during.body.nextCursor);
+        const ids = items.map((e) => e.id);
+        expect(ids).toContain(open.id);
+        expect(ids).toContain(later.id);
+        expect(items.find((e) => e.id === open.id)?.city).toBe('Pendiente');
+      } finally {
+        await client.query('ROLLBACK').catch(() => undefined);
+        client.release();
+      }
+    },
+    FEED_TEST_TIMEOUT_MS,
+  );
 
   it('CA-14: invalid cursor or limit is 400 and "changes" is not read as an id', async () => {
     const token = admin.token;

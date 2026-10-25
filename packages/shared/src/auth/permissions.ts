@@ -33,3 +33,33 @@ export const ESTABLISHMENT_PERMISSIONS = [
 ] as const;
 
 export type EstablishmentPermission = (typeof ESTABLISHMENT_PERMISSIONS)[number];
+
+/** Permissions of the categories module (services/core). Added to the catalog by migration. */
+export const CATEGORY_PERMISSIONS = [
+  'categories.read',
+  'categories.create',
+  'categories.update',
+  'categories.deactivate',
+] as const;
+
+export type CategoryPermission = (typeof CATEGORY_PERMISSIONS)[number];
+
+/** Permissions of the products module (services/core). Added to the catalog by migration. */
+export const PRODUCT_PERMISSIONS = [
+  'products.read',
+  'products.create',
+  'products.update',
+  'products.deactivate',
+] as const;
+
+export type ProductPermission = (typeof PRODUCT_PERMISSIONS)[number];
+
+/** Permissions of the inventories module; inventory lines are managed with these too. */
+export const INVENTORY_PERMISSIONS = [
+  'inventories.read',
+  'inventories.create',
+  'inventories.update',
+  'inventories.deactivate',
+] as const;
+
+export type InventoryPermission = (typeof INVENTORY_PERMISSIONS)[number];

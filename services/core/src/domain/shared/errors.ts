@@ -5,13 +5,16 @@ export interface FieldIssue {
   readonly message: string;
 }
 
+/** Item of a 409 `details` list that identifies an affected record (e.g. a line and its product). */
+export type ConflictDetail = Readonly<Record<string, string>>;
+
 /** Business error. The HTTP layer maps `kind` to a status code; messages are user-facing (Spanish). */
 export class DomainError extends Error {
   constructor(
     readonly kind: ErrorKind,
     message: string,
     readonly code?: string,
-    readonly details?: readonly FieldIssue[],
+    readonly details?: readonly (FieldIssue | ConflictDetail)[],
     /** Extra fields merged into the HTTP error body (e.g. `current` on a version conflict). */
     readonly extra?: Readonly<Record<string, unknown>>,
   ) {
@@ -32,4 +35,5 @@ export const conflictError = (
   message: string,
   code: string,
   extra?: Readonly<Record<string, unknown>>,
-): DomainError => new DomainError('conflict', message, code, undefined, extra);
+  details?: readonly ConflictDetail[],
+): DomainError => new DomainError('conflict', message, code, details, extra);

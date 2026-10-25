@@ -22,3 +22,10 @@ export function isPgError(error: unknown, code: string): boolean {
 }
 
 export const UNIQUE_VIOLATION = '23505';
+export const FOREIGN_KEY_VIOLATION = '23503';
+export const CHECK_VIOLATION = '23514';
+
+/** Name of the violated constraint of a PostgreSQL error, when it carries one. */
+export function violatedConstraint(error: unknown): string | undefined {
+  return (error as { constraint?: string } | null)?.constraint;
+}
