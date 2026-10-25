@@ -5,10 +5,12 @@ import type {
   EstablishmentRepository,
 } from '../../domain/establishment/establishment-repository.js';
 import { conflictError } from '../../domain/shared/errors.js';
+import type { ChangeBatch, ChangeCursor } from '../../domain/sync/change-cursor.js';
+import type { WriteOutcome } from '../../domain/sync/version.js';
 import { isPgError, UNIQUE_VIOLATION } from './pool.js';
 
 const COLUMNS = `id, name, address, city, department, phone, latitude, longitude, is_active,
-  created_at, updated_at`;
+  version, created_at, updated_at`;
 
 interface EstablishmentRow {
   id: string;
@@ -21,6 +23,7 @@ interface EstablishmentRow {
   latitude: string;
   longitude: string;
   is_active: boolean;
+  version: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -36,13 +39,19 @@ function toEstablishment(row: EstablishmentRow): Establishment {
     latitude: Number(row.latitude),
     longitude: Number(row.longitude),
     isActive: row.is_active,
+    version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
+const PRIMARY_KEY = 'establishments_pkey';
+
 function mapWriteError(error: unknown): never {
   if (isPgError(error, UNIQUE_VIOLATION)) {
+    if ((error as { constraint?: string }).constraint === PRIMARY_KEY) {
+      throw conflictError('Ya existe un establecimiento con ese id', 'ESTABLISHMENT_ID_TAKEN');
+    }
     throw conflictError('Ya existe un establecimiento con ese nombre', 'ESTABLISHMENT_NAME_TAKEN');
   }
   throw error;
@@ -67,12 +76,14 @@ export function escapeLike(text: string): string {
 export class PostgresEstablishmentRepository implements EstablishmentRepository {
   constructor(private readonly pool: Pool) {}
 
-  async create(data: EstablishmentData): Promise<Establishment> {
+  async create(data: EstablishmentData, id?: string): Promise<Establishment> {
     try {
       const { rows } = await this.pool.query<EstablishmentRow>(
-        `INSERT INTO establishments (name, address, city, department, phone, latitude, longitude)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${COLUMNS}`,
+        `INSERT INTO establishments (id, name, address, city, department, phone, latitude, longitude)
+         VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8)
+         RETURNING ${COLUMNS}`,
         [
+          id ?? null,
           data.name,
           data.address,
           data.city,
@@ -126,34 +137,72 @@ export class PostgresEstablishmentRepository implements EstablishmentRepository 
     id: string,
     changes: Partial<EstablishmentData>,
     now: Date,
-  ): Promise<Establishment | null> {
+    expectedVersion?: number,
+  ): Promise<WriteOutcome<Establishment>> {
     const keys = (Object.keys(changes) as (keyof EstablishmentData)[]).filter(
       (key) => key in COLUMN_OF,
     );
-    const params: unknown[] = [id, now];
+    const params: unknown[] = [id, now, expectedVersion ?? null];
     const sets = ['updated_at = $2'];
     for (const key of keys) {
       params.push(changes[key]);
       sets.push(`${COLUMN_OF[key]} = $${params.length}`);
     }
     try {
-      const { rows } = await this.pool.query<EstablishmentRow>(
-        `UPDATE establishments SET ${sets.join(', ')} WHERE id = $1 RETURNING ${COLUMNS}`,
-        params,
-      );
-      return rows[0] ? toEstablishment(rows[0]) : null;
+      return await this.conditionalUpdate(sets, params);
     } catch (error) {
       return mapWriteError(error);
     }
   }
 
-  async setActive(id: string, isActive: boolean, now: Date): Promise<Establishment | null> {
-    const { rows } = await this.pool.query<EstablishmentRow>(
-      `UPDATE establishments SET is_active = $2, updated_at = $3 WHERE id = $1
-       RETURNING ${COLUMNS}`,
-      [id, isActive, now],
+  async setActive(
+    id: string,
+    isActive: boolean,
+    now: Date,
+    expectedVersion?: number,
+  ): Promise<WriteOutcome<Establishment>> {
+    return this.conditionalUpdate(
+      ['updated_at = $2', 'is_active = $4'],
+      [id, now, expectedVersion ?? null, isActive],
     );
-    return rows[0] ? toEstablishment(rows[0]) : null;
+  }
+
+  /** $1 id, $2 now, $3 expected version (null = unconditional); extra `sets` use $4 onwards. */
+  private async conditionalUpdate(
+    sets: string[],
+    params: unknown[],
+  ): Promise<WriteOutcome<Establishment>> {
+    const { rows } = await this.pool.query<EstablishmentRow>(
+      `UPDATE establishments SET ${sets.join(', ')}, version = version + 1,
+         change_xid = pg_current_xact_id()
+       WHERE id = $1 AND ($3::integer IS NULL OR version = $3::integer) RETURNING ${COLUMNS}`,
+      params,
+    );
+    if (rows[0]) return { status: 'updated', value: toEstablishment(rows[0]) };
+    const current = await this.findById(params[0] as string);
+    return current ? { status: 'conflict', current } : { status: 'not_found' };
+  }
+
+  async listChanges(
+    cursor: ChangeCursor | null,
+    limit: number,
+  ): Promise<ChangeBatch<Establishment>> {
+    // The xmin bound is evaluated in the same statement that reads the rows: a change committed
+    // later by an older, still open transaction is never behind the returned cursor.
+    const { rows } = await this.pool.query<EstablishmentRow & { change_xid_text: string }>(
+      `SELECT ${COLUMNS}, change_xid::text AS change_xid_text FROM establishments
+       WHERE change_xid < pg_snapshot_xmin(pg_current_snapshot())
+         AND ($1::xid8 IS NULL OR (change_xid, id) > ($1::xid8, $2::uuid))
+       ORDER BY change_xid, id LIMIT $3`,
+      [cursor?.xid ?? null, cursor?.id ?? null, limit + 1],
+    );
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      items: page.map(toEstablishment),
+      hasMore: rows.length > limit,
+      last: last ? { xid: last.change_xid_text, id: last.id } : null,
+    };
   }
 
   async existsByName(name: string, excludeId?: string): Promise<boolean> {

@@ -20,6 +20,8 @@ export interface Establishment {
   readonly latitude: number;
   readonly longitude: number;
   readonly isActive: boolean;
+  /** Starts at 1; +1 on each effective edit or status change (optimistic concurrency, ADR-0002). */
+  readonly version: number;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }

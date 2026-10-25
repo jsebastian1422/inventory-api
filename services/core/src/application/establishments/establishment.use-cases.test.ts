@@ -115,3 +115,94 @@ describe('EstablishmentUseCases', () => {
     );
   });
 });
+
+describe('EstablishmentUseCases – sync protocol', () => {
+  it('versions: 1 on create, +1 per effective edit or status change, same status keeps it', async () => {
+    const a = await uc.create('a', input());
+    expect(a.version).toBe(1);
+    expect((await uc.update('a', a.id, { city: 'Cali' })).version).toBe(2);
+    expect((await uc.setStatus('a', a.id, false)).version).toBe(3);
+    expect((await uc.setStatus('a', a.id, false)).version).toBe(3);
+  });
+
+  it('creates with a client id and rejects an id already used', async () => {
+    const id = crypto.randomUUID();
+    expect((await uc.create('a', input(), id)).id).toBe(id);
+    expect(await codeOf(uc.create('a', input({ name: 'Otra' }), id))).toBe(
+      'conflict:ESTABLISHMENT_ID_TAKEN',
+    );
+  });
+
+  it('a stale expected version is a VERSION_CONFLICT with the server copy and a warn log', async () => {
+    const a = await uc.create('a', input());
+    await uc.update('a', a.id, { city: 'Cali' });
+    log.events.length = 0;
+    try {
+      await uc.update('actor-9', a.id, { city: 'Pasto' }, 1);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(DomainError);
+      const conflict = error as DomainError;
+      expect(conflict.code).toBe('VERSION_CONFLICT');
+      expect((conflict.extra?.current as { city: string }).city).toBe('Cali');
+    }
+    expect(log.events).toEqual([
+      {
+        level: 'warn',
+        event: 'establishment.version_conflict',
+        data: { establishmentId: a.id, actorId: 'actor-9', expectedVersion: 1, currentVersion: 2 },
+      },
+    ]);
+    expect((await repo.findById(a.id))!.city).toBe('Cali');
+    expect((await uc.update('a', a.id, { city: 'Pasto' }, 2)).version).toBe(3);
+  });
+
+  it('validation order: 404 before version conflict before name taken', async () => {
+    const a = await uc.create('a', input());
+    await uc.create('a', input({ name: 'Sede Sur' }));
+    expect(await codeOf(uc.update('a', crypto.randomUUID(), { city: 'x' }, 9))).toBe(
+      'not_found:NOT_FOUND',
+    );
+    expect(await codeOf(uc.update('a', a.id, { name: 'sede sur' }, 5))).toBe(
+      'conflict:VERSION_CONFLICT',
+    );
+    expect(await codeOf(uc.update('a', a.id, { name: 'sede sur' }, 1))).toBe(
+      'conflict:ESTABLISHMENT_NAME_TAKEN',
+    );
+  });
+
+  it('setStatus to the same state with a stale If-Match is still a conflict', async () => {
+    const a = await uc.create('a', input());
+    expect(await codeOf(uc.setStatus('a', a.id, true, 7))).toBe('conflict:VERSION_CONFLICT');
+    expect(await codeOf(uc.setStatus('a', a.id, false, 7))).toBe('conflict:VERSION_CONFLICT');
+    expect((await uc.setStatus('a', a.id, false, 1)).isActive).toBe(false);
+  });
+
+  it('feed: pages without repeating, keeps the cursor when nothing changed, rejects bad cursors', async () => {
+    const a = await uc.create('a', input({ name: 'A' }));
+    await uc.create('a', input({ name: 'B' }));
+    await uc.create('a', input({ name: 'C' }));
+    const first = await uc.listChanges(undefined, 2);
+    expect(first.items).toHaveLength(2);
+    expect(first.hasMore).toBe(true);
+    const second = await uc.listChanges(first.nextCursor!, 2);
+    expect(second.items).toHaveLength(1);
+    expect(second.hasMore).toBe(false);
+    const idle = await uc.listChanges(second.nextCursor!, 2);
+    expect(idle.items).toEqual([]);
+    expect(idle.nextCursor).toBe(second.nextCursor);
+    await uc.setStatus('a', a.id, false);
+    const after = await uc.listChanges(idle.nextCursor!, 10);
+    expect(after.items.map((e) => e.id)).toEqual([a.id]);
+    expect((await uc.listChanges(undefined, 5)).items).toHaveLength(3);
+    expect(
+      (
+        await new EstablishmentUseCases(new InMemoryEstablishmentRepository(), log).listChanges(
+          undefined,
+          5,
+        )
+      ).nextCursor,
+    ).toBeNull();
+    expect(await codeOf(uc.listChanges('***', 5))).toBe('validation:VALIDATION_ERROR');
+  });
+});

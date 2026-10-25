@@ -4,6 +4,7 @@ import type { Pool } from 'pg';
 import { AuthorizeUseCase } from '../../application/auth/authorize.use-case.js';
 import { CheckHealthUseCase } from '../../application/health/check-health.use-case.js';
 import { EstablishmentUseCases } from '../../application/establishments/establishment.use-cases.js';
+import { PostgresIdempotencyStore } from '../database/postgres-idempotency-store.js';
 import { PostgresAccessReader } from '../database/postgres-access-reader.js';
 import { PostgresEstablishmentRepository } from '../database/postgres-establishment-repository.js';
 import { PostgresHealthCheck } from '../database/postgres-health-check.js';
@@ -16,10 +17,12 @@ import { HealthController } from './health.controller.js';
 import { NestAuditLog } from './nest-audit-log.js';
 import {
   APP_CONFIG,
+  AUDIT_LOG,
   AUTHORIZE_USE_CASE,
   CHECK_HEALTH_USE_CASE,
   DB_POOL,
   ESTABLISHMENT_USE_CASES,
+  IDEMPOTENCY_STORE,
 } from './tokens.js';
 
 @Module({})
@@ -59,6 +62,12 @@ export class AppModule implements OnApplicationShutdown {
               new PostgresEstablishmentRepository(pool),
               new NestAuditLog(),
             ),
+          inject: [DB_POOL],
+        },
+        { provide: AUDIT_LOG, useFactory: () => new NestAuditLog() },
+        {
+          provide: IDEMPOTENCY_STORE,
+          useFactory: (pool: Pool) => new PostgresIdempotencyStore(pool),
           inject: [DB_POOL],
         },
         { provide: APP_GUARD, useClass: AuthGuard },

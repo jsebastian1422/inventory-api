@@ -24,6 +24,7 @@ const schema = databaseSchema.extend({
   JWT_PUBLIC_KEY_PATH: z.string().min(1).optional(),
   ACCESS_TOKEN_TTL: duration.default('15m'),
   REFRESH_TOKEN_TTL: duration.default('7d'),
+  CORS_ORIGINS: z.string().optional(),
 });
 
 export interface DatabaseConfig {
@@ -42,9 +43,37 @@ export interface IdentityConfig {
   readonly publicKeyPem: string;
   readonly accessTokenTtlSeconds: number;
   readonly refreshTokenTtlSeconds: number;
+  /** Allowed browser origins; empty = CORS disabled. */
+  readonly corsOrigins: readonly string[];
 }
 
 export class ConfigError extends Error {}
+
+/**
+ * Parses CORS_ORIGINS: comma-separated exact origins (`http(s)://host[:port]`, no path).
+ * Empty or absent means no CORS. Throws a ConfigError naming the invalid origin.
+ */
+export function parseCorsOrigins(raw: string | undefined): string[] {
+  const origins = (raw ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  for (const origin of origins) {
+    let normalized: string | null = null;
+    try {
+      const url = new URL(origin);
+      if (url.protocol === 'http:' || url.protocol === 'https:') normalized = url.origin;
+    } catch {
+      normalized = null;
+    }
+    if (normalized !== origin) {
+      throw new ConfigError(
+        `Invalid configuration. CORS_ORIGINS: "${origin}" is not a valid origin (use http(s)://host[:port] without path or trailing slash)`,
+      );
+    }
+  }
+  return origins;
+}
 
 type ReadFile = (path: string) => string;
 
@@ -128,5 +157,6 @@ export function loadConfig(
     ),
     accessTokenTtlSeconds: toSeconds(data.ACCESS_TOKEN_TTL),
     refreshTokenTtlSeconds: toSeconds(data.REFRESH_TOKEN_TTL),
+    corsOrigins: parseCorsOrigins(data.CORS_ORIGINS),
   };
 }

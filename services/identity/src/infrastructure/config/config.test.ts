@@ -52,3 +52,22 @@ describe('identity loadConfig', () => {
     expect(loadDatabaseConfig(valid).database).toBe('d');
   });
 });
+
+describe('identity CORS_ORIGINS', () => {
+  it('is empty when absent and parses exact origins', () => {
+    expect(loadConfig(valid, readFile).corsOrigins).toEqual([]);
+    expect(
+      loadConfig({ ...valid, CORS_ORIGINS: 'http://localhost:5173,https://a.com' }, readFile)
+        .corsOrigins,
+    ).toEqual(['http://localhost:5173', 'https://a.com']);
+  });
+
+  it.each(['localhost:5173', 'http://x.com/path', '*', 'ftp://x.com'])(
+    'fails naming CORS_ORIGINS for %j',
+    (origin) => {
+      expect(() => loadConfig({ ...valid, CORS_ORIGINS: origin }, readFile)).toThrow(
+        /CORS_ORIGINS/,
+      );
+    },
+  );
+});

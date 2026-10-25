@@ -33,10 +33,16 @@ Copia el ejemplo y ajustalo: `cp .env.example .env` (`.env` no se versiona).
 | `JWT_PRIVATE_KEY_PATH` o `JWT_PRIVATE_KEY`            | Clave privada ES256 (PKCS8 PEM): ruta o contenido            |
 | `JWT_PUBLIC_KEY_PATH` o `JWT_PUBLIC_KEY`              | Clave publica (SPKI PEM): ruta o contenido (identity y core) |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL`              | Vigencias (`15m`, `7d`; numero + s/m/h/d)                    |
+| `CORS_ORIGINS`                                        | Origenes permitidos (core e identity), separados por comas   |
 | `POSTGRES_TEST_DB`                                    | BD de pruebas de integracion (`inventory_test`)              |
 
 Las credenciales de `.env.example` (`change_me`) son solo de ejemplo: cambialas en tu `.env`.
 Los puertos deben estar entre 1 y 65535.
+
+`CORS_ORIGINS` es opcional: lista de origenes exactos (`http://localhost:5173,https://app.example.com`),
+sin ruta ni `/` final. Vacia o ausente = sin CORS. Un origen mal formado hace fallar el arranque indicando
+la variable. Se permiten los metodos `GET, POST, PUT, PATCH, DELETE, OPTIONS` y las cabeceras
+`Authorization, Content-Type, Idempotency-Key, If-Match` (sin cookies ni comodin).
 
 Si falta una variable requerida, la API termina al arrancar indicando cual.
 
@@ -66,7 +72,7 @@ npm run migrate:down   # revierte la ultima
 
 Leen `.env` si existe; sin `.env` funcionan igual si las variables `POSTGRES_*` estan en el entorno.
 
-Migraciones actuales (4):
+Migraciones actuales (6):
 
 | Migracion                    | Contenido                                                                              | `migrate:down` que la revierten |
 | ---------------------------- | -------------------------------------------------------------------------------------- | ------------------------------- |
@@ -74,11 +80,16 @@ Migraciones actuales (4):
 | `identity-seed`              | permisos de usuarios/roles y rol de sistema "Administrador" con todos ellos            | (ver arriba)                    |
 | `establishments`             | tabla `establishments` (nombre unico sin distinguir mayusculas, checks de coordenadas) | establecimientos: 2 en total    |
 | `establishments-permissions` | permisos `establishments.*` asignados al rol Administrador                             | (ver arriba)                    |
+| `establishments-sync`        | columnas `version` y `change_xid` e indice del feed de cambios en `establishments`     | sincronizacion: 2 en total      |
+| `idempotency-keys`           | tabla `idempotency_keys` (claves de idempotencia por usuario)                          | (ver arriba)                    |
 
-`migrate:down` revierte de una en una, en orden inverso: el modulo de establecimientos requiere 2
-ejecuciones (`establishments-permissions`, luego `establishments`) y el de identity otras 2 (`identity-seed`,
-luego `identity-tables`); para volver al estado vacio hacen falta 4. Revertir la semilla de identity falla si
-ya hay usuarios con el rol Administrador (la FK lo impide).
+`migrate:down` revierte de una en una, en orden inverso. Cuantas hacen falta por modulo: sincronizacion 2
+(`idempotency-keys`, luego `establishments-sync`), establecimientos 2 (`establishments-permissions`, luego
+`establishments`) e identity 2 (`identity-seed`, luego `identity-tables`); para volver a la BD vacia hacen
+falta 6. Revertir la semilla de identity falla si ya hay usuarios con el rol Administrador (la FK lo impide).
+
+Las migraciones cuyo `down` contiene `DROP` (todas las que eliminan tablas, columnas o indices) las aplica
+una persona, no los agentes: el hook de politica del proyecto bloquea esos comandos.
 
 ## Servicio identity
 
@@ -153,11 +164,45 @@ estado del usuario y los permisos de su rol en las tablas de identity (ADR-0001,
 | `GET /establishments/:id`                                                      | `establishments.read`       |
 | `PATCH /establishments/:id` (cualquier subconjunto; `phone: null` borra)       | `establishments.update`     |
 | `PATCH /establishments/:id/status` (`{"isActive": bool}`)                      | `establishments.deactivate` |
+| `GET /establishments/changes` (`cursor`, `limit` 1-500, def. 100)              | `establishments.read`       |
 
 Campos: `name` (max 150, unico sin distinguir mayusculas), `address` (255), `city` (100), `department` (100),
 `phone` (opcional, max 30, solo `0-9 + - ( )` y espacio), `latitude` [-90, 90] y `longitude` [-180, 180] como
 numeros JSON (6 decimales). Toda respuesta incluye `mapsUrl` (enlace de Google Maps). No hay borrado:
-las sedes se desactivan. Errores: 400 `VALIDATION_ERROR`, 401, 403, 404, 409 `ESTABLISHMENT_NAME_TAKEN`.
+las sedes se desactivan. Errores: 400 `VALIDATION_ERROR`, 401, 403, 404, 409 `ESTABLISHMENT_NAME_TAKEN`. Con el protocolo de sincronizacion tambien: 409 `VERSION_CONFLICT`,
+`ESTABLISHMENT_ID_TAKEN`, `IDEMPOTENCY_KEY_REUSED` e `IDEMPOTENCY_IN_PROGRESS` (ver la seccion siguiente).
+
+### Sincronizacion offline (ADR-0002) para el frontend
+
+Aplica a Establecimientos en core; las piezas son genericas para modulos futuros. Todo es opcional: un
+cliente que no envia `Idempotency-Key`, `If-Match` ni `id` se comporta como antes (la respuesta solo suma
+`version`).
+
+- **Id del cliente**: `POST /establishments` acepta `id` (UUID) para referenciar la sede creada offline.
+  Un id ya usado responde 409 `ESTABLISHMENT_ID_TAKEN`; mal formado, 400.
+- **`Idempotency-Key: <uuid>`** en `POST /establishments`, `PATCH /establishments/:id` y
+  `PATCH /establishments/:id/status`. Un reenvio con la misma clave y el mismo contenido (metodo, ruta,
+  cuerpo e `If-Match` normalizado a la version entera: `"3"` y `3` son lo mismo) devuelve el mismo status y cuerpo sin reaplicar (log `idempotency.replayed`).
+  Misma clave con otro contenido: 409 `IDEMPOTENCY_KEY_REUSED`; peticion simultanea en curso: 409
+  `IDEMPOTENCY_IN_PROGRESS` (reintentar). La clave es por usuario, dura 30 dias y solo se guardan
+  respuestas 2xx: un 400/403/404/409 libera la clave y el reintento se evalua de nuevo. Genera una clave
+  por operacion encolada y reutilizala en cada reintento.
+- **`version` + `If-Match: "<version>"`** en los dos PATCH. `version` empieza en 1 y sube 1 con cada
+  edicion o cambio de estado efectivo. Si `If-Match` no coincide: 409 `VERSION_CONFLICT` con
+  `current` (la sede del servidor, el servidor gana; la PWA decide que mostrar al usuario). Sin `If-Match`
+  gana la ultima escritura. `If-Match` mal formado o `*`: 400. Orden de errores al editar: 400, 404,
+  `VERSION_CONFLICT`, `ESTABLISHMENT_NAME_TAKEN`.
+- **Feed de cambios** `GET /establishments/changes?cursor=&limit=`: devuelve
+  `{ items, nextCursor, hasMore }` con todas las sedes (activas e inactivas) creadas o modificadas despues
+  del cursor. Sin cursor, desde el principio. Guarda el `nextCursor` (opaco) y usalo en la siguiente
+  consulta; no pierde cambios de transacciones concurrentes (una transaccion larga solo retrasa el feed).
+  Si no hay cambios devuelve `items` vacio y el mismo cursor (`null` si aun no habia cursor). Cursor
+  invalido o `limit` fuera de 1-500: 400.
+- Al sincronizar se aplican las validaciones, la unicidad de nombre y los permisos **vigentes**: permiso
+  retirado, 403 y no se crea nada; nombre ocupado, 409 `ESTABLISHMENT_NAME_TAKEN`.
+- **identity solo en linea**: login, refresh, logout, sesiones, usuarios, roles y permisos **no deben
+  encolarse offline**. identity no adopta el protocolo (ignora `Idempotency-Key` e `If-Match`); solo
+  habilita CORS con `CORS_ORIGINS`.
 
 ## Calidad
 

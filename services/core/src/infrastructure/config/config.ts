@@ -12,13 +12,45 @@ const schema = z.object({
   // Core only verifies tokens: it never receives the private key.
   JWT_PUBLIC_KEY: z.string().min(1).optional(),
   JWT_PUBLIC_KEY_PATH: z.string().min(1).optional(),
+  CORS_ORIGINS: z.string().optional(),
 });
 
-export type AppConfig = Omit<z.infer<typeof schema>, 'JWT_PUBLIC_KEY' | 'JWT_PUBLIC_KEY_PATH'> & {
+export type AppConfig = Omit<
+  z.infer<typeof schema>,
+  'JWT_PUBLIC_KEY' | 'JWT_PUBLIC_KEY_PATH' | 'CORS_ORIGINS'
+> & {
   readonly publicKeyPem: string;
+  /** Allowed browser origins; empty = CORS disabled. */
+  readonly corsOrigins: readonly string[];
 };
 
 export class ConfigError extends Error {}
+
+/**
+ * Parses CORS_ORIGINS: comma-separated exact origins (`http(s)://host[:port]`, no path).
+ * Empty or absent means no CORS. Throws a ConfigError naming the invalid origin.
+ */
+export function parseCorsOrigins(raw: string | undefined): string[] {
+  const origins = (raw ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  for (const origin of origins) {
+    let normalized: string | null = null;
+    try {
+      const url = new URL(origin);
+      if (url.protocol === 'http:' || url.protocol === 'https:') normalized = url.origin;
+    } catch {
+      normalized = null;
+    }
+    if (normalized !== origin) {
+      throw new ConfigError(
+        `Invalid configuration. CORS_ORIGINS: "${origin}" is not a valid origin (use http(s)://host[:port] without path or trailing slash)`,
+      );
+    }
+  }
+  return origins;
+}
 
 type ReadFile = (path: string) => string;
 
@@ -53,9 +85,10 @@ export function loadConfig(
       .join('; ');
     throw new ConfigError(`Invalid configuration. Check environment variables -> ${problems}`);
   }
-  const { JWT_PUBLIC_KEY, JWT_PUBLIC_KEY_PATH, ...rest } = result.data;
+  const { JWT_PUBLIC_KEY, JWT_PUBLIC_KEY_PATH, CORS_ORIGINS, ...rest } = result.data;
   return {
     ...rest,
+    corsOrigins: parseCorsOrigins(CORS_ORIGINS),
     publicKeyPem: resolvePublicKey(JWT_PUBLIC_KEY, JWT_PUBLIC_KEY_PATH, readFile),
   };
 }

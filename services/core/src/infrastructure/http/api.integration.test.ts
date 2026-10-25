@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ACCESS_TOKEN_ISSUER } from '@inventory/shared';
 import { loadConfig, type AppConfig } from '../config/config.js';
 import { AppModule } from './app.module.js';
+import { configureCors } from './cors.js';
 
 /**
  * Integration tests over HTTP against a real PostgreSQL. They use a SEPARATE database
@@ -37,12 +38,20 @@ interface Res {
 async function call(
   method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
   url: string,
-  options: { token?: string; body?: unknown; target?: NestFastifyApplication } = {},
+  options: {
+    token?: string;
+    body?: unknown;
+    target?: NestFastifyApplication;
+    headers?: Record<string, string>;
+  } = {},
 ): Promise<Res> {
   const response = await (options.target ?? app).inject({
     method,
     url,
-    headers: options.token ? { authorization: `Bearer ${options.token}` } : {},
+    headers: {
+      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+      ...options.headers,
+    },
     ...(options.body !== undefined ? { payload: options.body as object } : {}),
   });
   let body: unknown;
@@ -120,6 +129,7 @@ async function boot(cfg: AppConfig, sink?: string[]) {
     new FastifyAdapter(),
     { logger: { log: capture, warn: capture, error: capture, debug: capture, verbose: capture } },
   );
+  configureCors(instance, cfg.corsOrigins);
   await instance.init();
   await instance.getHttpAdapter().getInstance().ready();
   return instance;
@@ -131,7 +141,8 @@ beforeAll(async () => {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
   publicPem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
-  config = loadConfig({ ...env, JWT_PUBLIC_KEY: publicPem });
+  // CORS_ORIGINS is pinned: tests must not depend on the developer's .env (CORS tests set it explicitly).
+  config = loadConfig({ ...env, CORS_ORIGINS: '', JWT_PUBLIC_KEY: publicPem });
 
   try {
     execFileSync(
@@ -653,3 +664,722 @@ describe('logs, errors and health', () => {
 });
 
 const logs2: string[] = [];
+
+// ---------------------------------------------------------------------------------------------
+// Sprint 004: offline sync protocol (ADR-0002) and CORS
+// ---------------------------------------------------------------------------------------------
+
+type Sede = { id: string; name: string; version: number; city: string; isActive: boolean };
+const IDEM = 'Idempotency-Key';
+const uuid = () => crypto.randomUUID();
+const withKey = (key: string, extra: Record<string, string> = {}) => ({
+  [IDEM]: key,
+  ...extra,
+});
+
+/** Every captured log line (Nest's logger override is global: the last booted app owns it). */
+const allLogs = () => [...logs, ...logs2];
+
+/** JSON events of the captured logs that mention `needle`. */
+function eventsOf(needle: string): Record<string, unknown>[] {
+  return allLogs()
+    .filter((line) => line.includes(needle))
+    .map((line) => JSON.parse(/^\{.*\}/.exec(line)![0]) as Record<string, unknown>);
+}
+
+/** Reads the whole feed from `cursor`, page by page; returns every item and the final cursor. */
+async function drain(cursor?: string, limit = 3) {
+  const items: Sede[] = [];
+  let next = cursor;
+  for (let guard = 0; guard < 1000; guard++) {
+    const query = `limit=${limit}${next ? `&cursor=${next}` : ''}`;
+    const res = await call('GET', `/establishments/changes?${query}`, { token: admin.token });
+    expect(res.status).toBe(200);
+    items.push(...(res.body.items as Sede[]));
+    next = res.body.nextCursor ?? undefined;
+    if (!res.body.hasMore) return { items, cursor: next };
+  }
+  throw new Error('feed does not terminate');
+}
+
+describe('S4 versions and client ids (CA-2, CA-3)', () => {
+  it('CA-2: every representation has version; create 1, +1 per effective change, same status keeps it', async () => {
+    const created = await createSede();
+    expect(created.version).toBe(1);
+    const patch = (payload: object) =>
+      call('PATCH', `/establishments/${created.id}`, { token: admin.token, body: payload });
+    const status = (isActive: boolean) =>
+      call('PATCH', `/establishments/${created.id}/status`, {
+        token: admin.token,
+        body: { isActive },
+      });
+    expect((await patch({ city: 'Cali' })).body.version).toBe(2);
+    expect((await status(false)).body.version).toBe(3);
+    expect((await status(false)).body.version).toBe(3);
+    expect((await status(true)).body.version).toBe(4);
+    const got = await call('GET', `/establishments/${created.id}`, { token: admin.token });
+    expect(got.body.version).toBe(4);
+    const list = await call('GET', '/establishments?limit=200', { token: admin.token });
+    expect((list.body.items as Sede[]).find((e) => e.id === created.id)?.version).toBe(4);
+  });
+
+  it('CA-3: creates with the client id; a used id is 409 ESTABLISHMENT_ID_TAKEN; a bad id is 400', async () => {
+    const id = uuid();
+    const res = await call('POST', '/establishments', { token: admin.token, body: body({ id }) });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe(id);
+    const again = await call('POST', '/establishments', { token: admin.token, body: body({ id }) });
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe('ESTABLISHMENT_ID_TAKEN');
+    const bad = await call('POST', '/establishments', {
+      token: admin.token,
+      body: body({ id: 'not-a-uuid' }),
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body.details[0].field).toBe('id');
+  });
+
+  it('CA-3: concurrent creations with the same client id: one 201, the rest 409 ID_TAKEN', async () => {
+    const id = uuid();
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        call('POST', '/establishments', { token: admin.token, body: body({ id }) }),
+      ),
+    );
+    expect(results.filter((r) => r.status === 201)).toHaveLength(1);
+    for (const r of results.filter((r) => r.status !== 201)) {
+      expect(r.status).toBe(409);
+      expect(['ESTABLISHMENT_ID_TAKEN', 'ESTABLISHMENT_NAME_TAKEN']).toContain(r.body.code);
+    }
+  });
+});
+
+describe('S4 Idempotency-Key (CA-4 to CA-7)', () => {
+  it('CA-4: repeating POST, PATCH and PATCH status returns the same status and body without side effects', async () => {
+    const postKey = uuid();
+    const payload = body();
+    const first = await call('POST', '/establishments', {
+      token: admin.token,
+      body: payload,
+      headers: withKey(postKey),
+    });
+    expect(first.status).toBe(201);
+    const id = first.body.id as string;
+    const replayPost = await call('POST', '/establishments', {
+      token: admin.token,
+      body: payload,
+      headers: withKey(postKey),
+    });
+    expect(replayPost.status).toBe(201);
+    expect(replayPost.body).toEqual(first.body);
+    const count = await pool.query('SELECT count(*) FROM establishments WHERE name = $1', [
+      payload.name,
+    ]);
+    expect(Number(count.rows[0].count)).toBe(1);
+
+    const patchKey = uuid();
+    const patched = await call('PATCH', `/establishments/${id}`, {
+      token: admin.token,
+      body: { city: 'Pasto' },
+      headers: withKey(patchKey),
+    });
+    const replayPatch = await call('PATCH', `/establishments/${id}`, {
+      token: admin.token,
+      body: { city: 'Pasto' },
+      headers: withKey(patchKey),
+    });
+    expect(replayPatch.status).toBe(patched.status);
+    expect(replayPatch.body).toEqual(patched.body);
+    expect(replayPatch.body.version).toBe(2);
+
+    const statusKey = uuid();
+    const off = await call('PATCH', `/establishments/${id}/status`, {
+      token: admin.token,
+      body: { isActive: false },
+      headers: withKey(statusKey),
+    });
+    const replayOff = await call('PATCH', `/establishments/${id}/status`, {
+      token: admin.token,
+      body: { isActive: false },
+      headers: withKey(statusKey),
+    });
+    expect(replayOff.body).toEqual(off.body);
+    expect(replayOff.body.version).toBe(3);
+
+    const current = await call('GET', `/establishments/${id}`, { token: admin.token });
+    expect(current.body.version).toBe(3);
+    // One event per real write; replays leave their own log line.
+    expect(
+      eventsOf(id)
+        .map((e) => e.event)
+        .filter((e) => String(e).startsWith('establishment.')),
+    ).toEqual(['establishment.created', 'establishment.updated', 'establishment.deactivated']);
+    const replays = allLogs().filter((l) => l.includes('idempotency.replayed'));
+    for (const key of [postKey, patchKey, statusKey]) {
+      expect(replays.some((l) => l.includes(key) && l.includes(admin.userId))).toBe(true);
+    }
+  });
+
+  it('a malformed Idempotency-Key is 400 naming the header', async () => {
+    const res = await call('POST', '/establishments', {
+      token: admin.token,
+      body: body(),
+      headers: withKey('not-a-uuid'),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_ERROR');
+    expect(res.body.details[0].field).toBe(IDEM);
+  });
+
+  it('H-6: alternating the If-Match format with the same key is a replay, not a reuse', async () => {
+    const key = uuid();
+    const sede = await createSede();
+    const first = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: 'A' },
+      headers: withKey(key, { 'If-Match': '"1"' }),
+    });
+    expect(first.status).toBe(200);
+    const again = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: 'A' },
+      headers: withKey(key, { 'If-Match': '1' }),
+    });
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual(first.body);
+    const current = await call('GET', `/establishments/${sede.id}`, { token: admin.token });
+    expect(current.body.version).toBe(2);
+  });
+
+  it('CA-5: same key with other content is 409 IDEMPOTENCY_KEY_REUSED (also for If-Match)', async () => {
+    const key = uuid();
+    const sede = await createSede();
+    const ok = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: 'A' },
+      headers: withKey(key),
+    });
+    expect(ok.status).toBe(200);
+    for (const [payload, extra] of [
+      [{ city: 'B' }, {}],
+      [{ city: 'A' }, { 'If-Match': '"2"' }],
+    ] as const) {
+      const res = await call('PATCH', `/establishments/${sede.id}`, {
+        token: admin.token,
+        body: payload,
+        headers: withKey(key, extra),
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+    }
+    const other = await call('PATCH', `/establishments/${uuid()}`, {
+      token: admin.token,
+      body: { city: 'A' },
+      headers: withKey(key),
+    });
+    expect(other.body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+  });
+
+  it('CA-5: simultaneous requests with the same key apply once', async () => {
+    const key = uuid();
+    const payload = body();
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        call('POST', '/establishments', {
+          token: admin.token,
+          body: payload,
+          headers: withKey(key),
+        }),
+      ),
+    );
+    const created = results.filter((r) => r.status === 201);
+    expect(created.length).toBeGreaterThanOrEqual(1);
+    for (const r of results.filter((r) => r.status !== 201)) {
+      expect(r.status).toBe(409);
+      expect(r.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+    }
+    expect(new Set(created.map((r) => r.body.id)).size).toBe(1);
+    const count = await pool.query('SELECT count(*) FROM establishments WHERE name = $1', [
+      payload.name,
+    ]);
+    expect(Number(count.rows[0].count)).toBe(1);
+  });
+
+  it('CA-6: failed writes do not keep the key; the retry after fixing the cause is applied', async () => {
+    const user = await actor(['establishments.read']);
+    const key = uuid();
+    const payload = body();
+    const denied = await call('POST', '/establishments', {
+      token: user.token,
+      body: payload,
+      headers: withKey(key),
+    });
+    expect(denied.status).toBe(403);
+    await pool.query(
+      `INSERT INTO role_permissions (role_id, permission_id)
+       SELECT $1, id FROM permissions WHERE code = 'establishments.create'`,
+      [user.roleId],
+    );
+    const retry = await call('POST', '/establishments', {
+      token: user.token,
+      body: payload,
+      headers: withKey(key),
+    });
+    expect(retry.status).toBe(201);
+
+    const stored = await pool.query('SELECT 1 FROM idempotency_keys WHERE actor_id = $1', [
+      user.userId,
+    ]);
+    expect(stored.rows).toHaveLength(1);
+
+    // 400 (invalid data), 404 and 409 (name taken) also release the key.
+    const key2 = uuid();
+    const sede = await createSede();
+    const invalid = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: '' },
+      headers: withKey(key2),
+    });
+    expect(invalid.status).toBe(400);
+    const fixed = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: '' },
+      headers: withKey(key2),
+    });
+    expect(fixed.status).toBe(400);
+    const missing = await call('PATCH', `/establishments/${uuid()}`, {
+      token: admin.token,
+      body: { city: 'X' },
+      headers: withKey(uuid()),
+    });
+    expect(missing.status).toBe(404);
+    const rows = await pool.query(
+      `SELECT 1 FROM idempotency_keys WHERE actor_id = $1 AND key = $2`,
+      [admin.userId, key2],
+    );
+    expect(rows.rows).toHaveLength(0);
+  });
+
+  it('CA-7: the same key from another user never returns the first response', async () => {
+    const key = uuid();
+    const payload = body();
+    const first = await call('POST', '/establishments', {
+      token: admin.token,
+      body: payload,
+      headers: withKey(key),
+    });
+    expect(first.status).toBe(201);
+    const other = await actor(ALL);
+    const second = await call('POST', '/establishments', {
+      token: other.token,
+      body: payload,
+      headers: withKey(key),
+    });
+    // Not a replay: the other actor's request runs on its own (name already taken -> 409).
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe('ESTABLISHMENT_NAME_TAKEN');
+    const fresh = await call('POST', '/establishments', {
+      token: other.token,
+      body: body(),
+      headers: withKey(key),
+    });
+    expect(fresh.status).toBe(201);
+    expect(fresh.body.id).not.toBe(first.body.id);
+  });
+
+  it('a replay still requires a valid token and the endpoint permission', async () => {
+    const key = uuid();
+    const user = await actor(['establishments.read', 'establishments.create']);
+    const payload = body();
+    expect(
+      (
+        await call('POST', '/establishments', {
+          token: user.token,
+          body: payload,
+          headers: withKey(key),
+        })
+      ).status,
+    ).toBe(201);
+    await pool.query(
+      `DELETE FROM role_permissions WHERE role_id = $1
+       AND permission_id = (SELECT id FROM permissions WHERE code = 'establishments.create')`,
+      [user.roleId],
+    );
+    const replay = await call('POST', '/establishments', {
+      token: user.token,
+      body: payload,
+      headers: withKey(key),
+    });
+    expect(replay.status).toBe(403);
+    const anonymous = await call('POST', '/establishments', {
+      body: payload,
+      headers: withKey(key),
+    });
+    expect(anonymous.status).toBe(401);
+  });
+});
+
+describe('S4 If-Match (CA-8 to CA-10, CA-15)', () => {
+  it('CA-8: matching version applies; stale version is 409 VERSION_CONFLICT with current, unchanged, logged', async () => {
+    const sede = await createSede();
+    const ok = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: 'Cali' },
+      headers: { 'If-Match': '"1"' },
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.version).toBe(2);
+
+    const stale = await call('PATCH', `/establishments/${sede.id}`, {
+      token: admin.token,
+      body: { city: 'Pasto' },
+      headers: { 'If-Match': '"1"' },
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('VERSION_CONFLICT');
+    expect(stale.body.current.city).toBe('Cali');
+    expect(stale.body.current.version).toBe(2);
+    expect(stale.body.current.mapsUrl).toContain('google.com/maps');
+    const unchanged = await call('GET', `/establishments/${sede.id}`, { token: admin.token });
+    expect(unchanged.body.city).toBe('Cali');
+    expect(unchanged.body.version).toBe(2);
+
+    const staleStatus = await call('PATCH', `/establishments/${sede.id}/status`, {
+      token: admin.token,
+      body: { isActive: false },
+      headers: { 'If-Match': '1' },
+    });
+    expect(staleStatus.status).toBe(409);
+    expect(staleStatus.body.current.isActive).toBe(true);
+    const okStatus = await call('PATCH', `/establishments/${sede.id}/status`, {
+      token: admin.token,
+      body: { isActive: false },
+      headers: { 'If-Match': '2' },
+    });
+    expect(okStatus.status).toBe(200);
+    expect(okStatus.body.version).toBe(3);
+
+    const conflicts = eventsOf(sede.id).filter((e) => e.event === 'establishment.version_conflict');
+    expect(conflicts).toHaveLength(2);
+    expect(conflicts[0]).toMatchObject({
+      establishmentId: sede.id,
+      actorId: admin.userId,
+      expectedVersion: 1,
+      currentVersion: 2,
+    });
+  });
+
+  it('CA-8: of two simultaneous edits with the same If-Match exactly one wins', async () => {
+    const sede = await createSede();
+    const results = await Promise.all(
+      ['A', 'B', 'C', 'D'].map((city) =>
+        call('PATCH', `/establishments/${sede.id}`, {
+          token: admin.token,
+          body: { city },
+          headers: { 'If-Match': '"1"' },
+        }),
+      ),
+    );
+    expect(results.filter((r) => r.status === 200)).toHaveLength(1);
+    for (const r of results.filter((r) => r.status !== 200)) {
+      expect(r.body.code).toBe('VERSION_CONFLICT');
+    }
+    const final = await call('GET', `/establishments/${sede.id}`, { token: admin.token });
+    expect(final.body.version).toBe(2);
+  });
+
+  it('CA-8: same state with a stale If-Match is still a conflict', async () => {
+    const sede = await createSede();
+    const res = await call('PATCH', `/establishments/${sede.id}/status`, {
+      token: admin.token,
+      body: { isActive: true },
+      headers: { 'If-Match': '9' },
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it('CA-9: without If-Match the sprint 003 behaviour holds; malformed or * is 400', async () => {
+    const sede = await createSede();
+    expect(
+      (
+        await call('PATCH', `/establishments/${sede.id}`, {
+          token: admin.token,
+          body: { city: 'Sin precondicion' },
+        })
+      ).status,
+    ).toBe(200);
+    for (const value of ['*', 'abc', '0', '"1", "2"', 'W/"1"']) {
+      for (const [url, payload] of [
+        [`/establishments/${sede.id}`, { city: 'x' }],
+        [`/establishments/${sede.id}/status`, { isActive: false }],
+      ] as const) {
+        const res = await call('PATCH', url, {
+          token: admin.token,
+          body: payload,
+          headers: { 'If-Match': value },
+        });
+        expect(res.status, `${url} If-Match ${value}`).toBe(400);
+        expect(res.body.code).toBe('VALIDATION_ERROR');
+        expect(res.body.details[0].field).toBe('If-Match');
+      }
+    }
+  });
+
+  it('CA-10: errors come in order 400 -> 404 -> VERSION_CONFLICT -> NAME_TAKEN', async () => {
+    const a = await createSede();
+    const b = await createSede();
+    const headers = { 'If-Match': '"9"' };
+    const invalid = await call('PATCH', `/establishments/${a.id}`, {
+      token: admin.token,
+      body: { name: '' },
+      headers,
+    });
+    expect(invalid.status).toBe(400);
+    const missing = await call('PATCH', `/establishments/${uuid()}`, {
+      token: admin.token,
+      body: { name: 'Nuevo nombre' },
+      headers,
+    });
+    expect(missing.status).toBe(404);
+    const stale = await call('PATCH', `/establishments/${a.id}`, {
+      token: admin.token,
+      body: { name: b.name },
+      headers,
+    });
+    expect(stale.body.code).toBe('VERSION_CONFLICT');
+    const taken = await call('PATCH', `/establishments/${a.id}`, {
+      token: admin.token,
+      body: { name: b.name },
+      headers: { 'If-Match': '"1"' },
+    });
+    expect(taken.status).toBe(409);
+    expect(taken.body.code).toBe('ESTABLISHMENT_NAME_TAKEN');
+  });
+
+  it('CA-15: when syncing, permissions, validation and uniqueness of the moment apply', async () => {
+    const user = await actor(['establishments.read', 'establishments.create']);
+    const before = await pool.query('SELECT count(*) FROM establishments');
+    await pool.query(
+      `DELETE FROM role_permissions WHERE role_id = $1
+       AND permission_id = (SELECT id FROM permissions WHERE code = 'establishments.create')`,
+      [user.roleId],
+    );
+    const id = uuid();
+    const denied = await call('POST', '/establishments', {
+      token: user.token,
+      body: body({ id }),
+      headers: withKey(uuid()),
+    });
+    expect(denied.status).toBe(403);
+    const after = await pool.query('SELECT count(*) FROM establishments');
+    expect(after.rows[0].count).toBe(before.rows[0].count);
+    const missing = await call('GET', `/establishments/${id}`, { token: admin.token });
+    expect(missing.status).toBe(404);
+
+    const existing = await createSede();
+    const taken = await call('POST', '/establishments', {
+      token: admin.token,
+      body: body({ id: uuid(), name: existing.name.toUpperCase() }),
+      headers: withKey(uuid()),
+    });
+    expect(taken.status).toBe(409);
+    expect(taken.body.code).toBe('ESTABLISHMENT_NAME_TAKEN');
+  });
+});
+
+describe('S4 change feed (CA-11 to CA-14)', () => {
+  it('CA-11: without cursor returns every establishment (active and inactive) without repeats or gaps', async () => {
+    for (let i = 0; i < 4; i++) await createSede();
+    const off = await createSede();
+    await call('PATCH', `/establishments/${off.id}/status`, {
+      token: admin.token,
+      body: { isActive: false },
+    });
+    const { items } = await drain(undefined, 3);
+    const ids = items.map((e) => e.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    const all = await pool.query<{ id: string }>('SELECT id FROM establishments');
+    expect([...ids].sort()).toEqual(all.rows.map((r) => r.id).sort());
+    expect(items.find((e) => e.id === off.id)?.isActive).toBe(false);
+
+    const page = await call('GET', '/establishments/changes?limit=2', { token: admin.token });
+    expect(page.status).toBe(200);
+    expect(Object.keys(page.body).sort()).toEqual(['hasMore', 'items', 'nextCursor']);
+    expect(page.body.items).toHaveLength(2);
+    expect(page.body.hasMore).toBe(true);
+    expect(typeof page.body.nextCursor).toBe('string');
+  });
+
+  it('CA-12: from a cursor returns exactly what was created, edited, activated or deactivated after', async () => {
+    const a = await createSede();
+    const b = await createSede();
+    const { cursor } = await drain();
+    expect(cursor).toBeTruthy();
+    const idle = await call('GET', `/establishments/changes?cursor=${cursor}`, {
+      token: admin.token,
+    });
+    expect(idle.body).toEqual({ items: [], nextCursor: cursor, hasMore: false });
+
+    const c = await createSede();
+    await call('PATCH', `/establishments/${a.id}`, {
+      token: admin.token,
+      body: { city: 'Leticia' },
+    });
+    await call('PATCH', `/establishments/${b.id}/status`, {
+      token: admin.token,
+      body: { isActive: false },
+    });
+    const { items, cursor: end } = await drain(cursor);
+    expect(items.map((e) => e.id).sort()).toEqual([a.id, b.id, c.id].sort());
+    expect(items.find((e) => e.id === a.id)?.city).toBe('Leticia');
+    expect(items.find((e) => e.id === b.id)?.isActive).toBe(false);
+    expect((await drain(end)).items).toEqual([]);
+  });
+
+  it('CA-12: an idempotent replay or a conflict does not produce feed entries', async () => {
+    const a = await createSede();
+    const { cursor } = await drain();
+    await call('PATCH', `/establishments/${a.id}`, {
+      token: admin.token,
+      body: { city: 'X' },
+      headers: { 'If-Match': '"9"' },
+    });
+    await call('PATCH', `/establishments/${a.id}/status`, {
+      token: admin.token,
+      body: { isActive: true },
+    });
+    expect((await drain(cursor)).items).toEqual([]);
+  });
+
+  it('CA-13: a change in a transaction still open while reading is not lost: it shows up later', async () => {
+    const open = await createSede();
+    const { cursor: start } = await drain();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE establishments SET city = 'Pendiente', version = version + 1,
+           change_xid = pg_current_xact_id() WHERE id = $1`,
+        [open.id],
+      );
+      // A later transaction commits while the first one is still open.
+      const later = await createSede();
+
+      const during = await call('GET', `/establishments/changes?cursor=${start}`, {
+        token: admin.token,
+      });
+      expect(during.status).toBe(200);
+      const seen = (during.body.items as Sede[]).map((e) => e.id);
+      expect(seen).not.toContain(open.id);
+      expect(seen).not.toContain(later.id);
+      expect(during.body.nextCursor).toBe(start);
+
+      await client.query('COMMIT');
+      const { items } = await drain(during.body.nextCursor);
+      const ids = items.map((e) => e.id);
+      expect(ids).toContain(open.id);
+      expect(ids).toContain(later.id);
+      expect(items.find((e) => e.id === open.id)?.city).toBe('Pendiente');
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+
+  it('CA-14: invalid cursor or limit is 400 and "changes" is not read as an id', async () => {
+    const token = admin.token;
+    const bad = [
+      'cursor=***',
+      `cursor=${Buffer.from('{oops').toString('base64url')}`,
+      `cursor=${Buffer.from(JSON.stringify({ x: '12a', i: uuid() })).toString('base64url')}`,
+      `cursor=${Buffer.from(JSON.stringify({ x: '1', i: 'nope' })).toString('base64url')}`,
+      `cursor=${Buffer.from(JSON.stringify({ x: '99999999999999999999999', i: uuid() })).toString('base64url')}`,
+      'limit=0',
+      'limit=501',
+      'limit=abc',
+    ];
+    for (const query of bad) {
+      const res = await call('GET', `/establishments/changes?${query}`, { token });
+      expect(res.status, query).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    }
+    const edge = await call('GET', '/establishments/changes?limit=500', { token });
+    expect(edge.status).toBe(200);
+    const plain = await call('GET', '/establishments/changes', { token });
+    expect(plain.status).toBe(200);
+    expect(plain.body).toHaveProperty('items');
+  });
+
+  it('the feed requires establishments.read', async () => {
+    const user = await actor(['establishments.create']);
+    expect((await call('GET', '/establishments/changes', { token: user.token })).status).toBe(403);
+    expect((await call('GET', '/establishments/changes')).status).toBe(401);
+  });
+});
+
+describe('S4 CORS (CA-17)', () => {
+  const allowed = 'http://localhost:5173';
+
+  it('with CORS_ORIGINS: preflight and requests from the allowed origin carry CORS headers', async () => {
+    const cors = await boot(
+      { ...config, corsOrigins: [allowed, 'https://app.example.com'] },
+      logs2,
+    );
+    try {
+      const pre = await cors.inject({
+        method: 'OPTIONS',
+        url: '/establishments',
+        headers: {
+          origin: allowed,
+          'access-control-request-method': 'PATCH',
+          'access-control-request-headers': 'authorization,idempotency-key,if-match,content-type',
+        },
+      });
+      expect(pre.statusCode).toBeLessThan(300);
+      expect(pre.headers['access-control-allow-origin']).toBe(allowed);
+      expect(String(pre.headers['access-control-allow-methods'])).toMatch(/PATCH/);
+      const headers = String(pre.headers['access-control-allow-headers']).toLowerCase();
+      for (const name of ['authorization', 'content-type', 'idempotency-key', 'if-match']) {
+        expect(headers).toContain(name);
+      }
+      expect(pre.headers['access-control-allow-credentials']).toBeUndefined();
+
+      const real = await call('GET', '/establishments?limit=1', {
+        token: admin.token,
+        target: cors,
+        headers: { origin: allowed },
+      });
+      expect(real.status).toBe(200);
+      const response = await cors.inject({
+        method: 'GET',
+        url: '/health',
+        headers: { origin: 'https://app.example.com' },
+      });
+      expect(response.headers['access-control-allow-origin']).toBe('https://app.example.com');
+
+      const denied = await cors.inject({
+        method: 'OPTIONS',
+        url: '/establishments',
+        headers: { origin: 'http://evil.example', 'access-control-request-method': 'GET' },
+      });
+      expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+      const deniedGet = await cors.inject({
+        method: 'GET',
+        url: '/health',
+        headers: { origin: 'http://evil.example' },
+      });
+      expect(deniedGet.headers['access-control-allow-origin']).toBeUndefined();
+    } finally {
+      await cors.close();
+    }
+  });
+
+  it('without CORS_ORIGINS there are no CORS headers', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/health',
+      headers: { origin: allowed },
+    });
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
+  });
+});

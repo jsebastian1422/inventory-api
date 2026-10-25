@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
 import { loadConfig } from './infrastructure/config/config.js';
 import { AppModule } from './infrastructure/http/app.module.js';
+import { configureCors } from './infrastructure/http/cors.js';
 
 async function bootstrap(): Promise<void> {
   // Validate configuration first: fail fast with a clear message.
@@ -11,6 +12,7 @@ async function bootstrap(): Promise<void> {
     AppModule.register(config),
     new FastifyAdapter(),
   );
+  configureCors(app, config.corsOrigins);
   app.enableShutdownHooks();
   await app.listen(config.API_PORT, config.API_HOST);
 }

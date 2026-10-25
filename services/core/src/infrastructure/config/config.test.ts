@@ -59,3 +59,28 @@ describe('loadConfig', () => {
     );
   });
 });
+
+describe('CORS_ORIGINS', () => {
+  it('is empty when absent or blank', () => {
+    expect(loadConfig(valid).corsOrigins).toEqual([]);
+    expect(loadConfig({ ...valid, CORS_ORIGINS: ' , ' }).corsOrigins).toEqual([]);
+  });
+
+  it('parses a comma-separated list of exact origins', () => {
+    const env = { ...valid, CORS_ORIGINS: 'http://localhost:5173, https://app.example.com' };
+    expect(loadConfig(env).corsOrigins).toEqual([
+      'http://localhost:5173',
+      'https://app.example.com',
+    ]);
+  });
+
+  it.each(['localhost:5173', 'ftp://x.com', 'http://x.com/path', 'http://x.com/', '*', 'nope'])(
+    'fails naming CORS_ORIGINS for %j',
+    (origin) => {
+      expect(() => loadConfig({ ...valid, CORS_ORIGINS: `http://ok.com,${origin}` })).toThrow(
+        ConfigError,
+      );
+      expect(() => loadConfig({ ...valid, CORS_ORIGINS: origin })).toThrow(/CORS_ORIGINS/);
+    },
+  );
+});

@@ -12,6 +12,8 @@ export class DomainError extends Error {
     message: string,
     readonly code?: string,
     readonly details?: readonly FieldIssue[],
+    /** Extra fields merged into the HTTP error body (e.g. `current` on a version conflict). */
+    readonly extra?: Readonly<Record<string, unknown>>,
   ) {
     super(message);
     this.name = 'DomainError';
@@ -26,5 +28,8 @@ export const forbiddenError = (message: string, code = 'FORBIDDEN'): DomainError
   new DomainError('forbidden', message, code);
 export const notFoundError = (message: string): DomainError =>
   new DomainError('not_found', message, 'NOT_FOUND');
-export const conflictError = (message: string, code: string): DomainError =>
-  new DomainError('conflict', message, code);
+export const conflictError = (
+  message: string,
+  code: string,
+  extra?: Readonly<Record<string, unknown>>,
+): DomainError => new DomainError('conflict', message, code, undefined, extra);

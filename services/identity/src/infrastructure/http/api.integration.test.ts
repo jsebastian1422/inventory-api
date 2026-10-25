@@ -13,6 +13,7 @@ import { loadConfig, type IdentityConfig } from '../config/config.js';
 import { createPool } from '../database/pool.js';
 import { Argon2PasswordHasher } from '../security/argon2-password-hasher.js';
 import { AppModule } from './app.module.js';
+import { configureCors } from './cors.js';
 import { createRepositories } from './composition.js';
 
 /**
@@ -112,6 +113,8 @@ beforeAll(async () => {
   privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
   config = loadConfig({
     ...env,
+    // Pinned: tests must not depend on the developer's .env (CORS tests set it explicitly).
+    CORS_ORIGINS: '',
     JWT_PRIVATE_KEY: privatePem,
     JWT_PUBLIC_KEY: publicKey.export({ type: 'spki', format: 'pem' }) as string,
   });
@@ -832,5 +835,74 @@ describe('logs', () => {
     ]) {
       expect(all).not.toContain(secret);
     }
+  });
+});
+
+describe('CORS (sprint 004)', () => {
+  const allowed = 'http://localhost:5173';
+
+  async function bootWith(corsOrigins: string[]) {
+    const sink: string[] = [];
+    const capture = (...args: unknown[]) => sink.push(args.map(String).join(' '));
+    const instance = await NestFactory.create<NestFastifyApplication>(
+      AppModule.register({ ...config, corsOrigins }),
+      new FastifyAdapter(),
+      { logger: { log: capture, warn: capture, error: capture, debug: capture, verbose: capture } },
+    );
+    configureCors(instance, corsOrigins);
+    await instance.init();
+    await instance.getHttpAdapter().getInstance().ready();
+    return instance;
+  }
+
+  it('CA-17: with CORS_ORIGINS the allowed origin gets preflight and response headers; others do not', async () => {
+    const cors = await bootWith([allowed]);
+    try {
+      const pre = await cors.inject({
+        method: 'OPTIONS',
+        url: '/auth/login',
+        headers: {
+          origin: allowed,
+          'access-control-request-method': 'POST',
+          'access-control-request-headers': 'content-type,idempotency-key,if-match,authorization',
+        },
+      });
+      expect(pre.statusCode).toBeLessThan(300);
+      expect(pre.headers['access-control-allow-origin']).toBe(allowed);
+      expect(String(pre.headers['access-control-allow-methods'])).toMatch(/POST/);
+      const headers = String(pre.headers['access-control-allow-headers']).toLowerCase();
+      for (const name of ['authorization', 'content-type', 'idempotency-key', 'if-match']) {
+        expect(headers).toContain(name);
+      }
+      const real = await cors.inject({
+        method: 'GET',
+        url: '/health',
+        headers: { origin: allowed },
+      });
+      expect(real.statusCode).toBe(200);
+      expect(real.headers['access-control-allow-origin']).toBe(allowed);
+      const denied = await cors.inject({
+        method: 'GET',
+        url: '/health',
+        headers: { origin: 'http://evil.example' },
+      });
+      expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+    } finally {
+      await cors.close();
+    }
+  });
+
+  it('CA-17: without CORS_ORIGINS there are no CORS headers', async () => {
+    const res = await app.inject({ method: 'GET', url: '/health', headers: { origin: allowed } });
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('CA-16: Idempotency-Key and If-Match are ignored by identity', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/health',
+      headers: { 'idempotency-key': 'not-a-uuid', 'if-match': '*' },
+    });
+    expect(res.statusCode).toBe(200);
   });
 });

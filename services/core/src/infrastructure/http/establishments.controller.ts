@@ -8,14 +8,18 @@ import {
   type EstablishmentInput,
 } from '../../domain/establishment/establishment.js';
 import type { StatusFilter } from '../../domain/establishment/establishment-repository.js';
+import { DomainError } from '../../domain/shared/errors.js';
 import { CurrentUserId, RequirePermissions } from './auth-decorators.js';
 import {
   createEstablishmentSchema,
   establishmentStatusSchema,
   idSchema,
+  listChangesQuerySchema,
   listEstablishmentsQuerySchema,
   updateEstablishmentSchema,
 } from './schemas.js';
+import { Idempotent } from './idempotency.interceptor.js';
+import { IfMatchVersion } from './if-match.js';
 import { ESTABLISHMENT_USE_CASES } from './tokens.js';
 import { ZodValidationPipe } from './zod-validation.pipe.js';
 
@@ -38,10 +42,25 @@ function present(e: Establishment) {
     latitude: e.latitude,
     longitude: e.longitude,
     isActive: e.isActive,
+    version: e.version,
     mapsUrl: buildMapsUrl(e.latitude, e.longitude),
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
+}
+
+/** A VERSION_CONFLICT carries the server copy: answer it in the public representation. */
+async function presentingConflict<T>(operation: Promise<T>): Promise<T> {
+  try {
+    return await operation;
+  } catch (error) {
+    if (error instanceof DomainError && error.code === 'VERSION_CONFLICT' && error.extra?.current) {
+      throw new DomainError(error.kind, error.message, error.code, error.details, {
+        current: present(error.extra.current as Establishment),
+      });
+    }
+    throw error;
+  }
 }
 
 @Controller('establishments')
@@ -50,11 +69,14 @@ export class EstablishmentsController {
 
   @Post()
   @RequirePermissions(PERM_CREATE)
+  @Idempotent()
   async create(
     @CurrentUserId() actorId: string,
-    @Body(new ZodValidationPipe(createEstablishmentSchema)) body: EstablishmentInput,
+    @Body(new ZodValidationPipe(createEstablishmentSchema))
+    body: EstablishmentInput & { id?: string },
   ) {
-    return present(await this.uc.create(actorId, body));
+    const { id, ...input } = body;
+    return present(await this.uc.create(actorId, input, id));
   }
 
   @Get()
@@ -72,6 +94,20 @@ export class EstablishmentsController {
     return { items: items.map(present), total, limit: query.limit, offset: query.offset };
   }
 
+  /** Registered before `:id` so that `changes` is not taken as an id. */
+  @Get('changes')
+  @RequirePermissions(PERM_READ)
+  async changes(
+    @Query(new ZodValidationPipe(listChangesQuerySchema))
+    query: {
+      cursor?: string;
+      limit: number;
+    },
+  ) {
+    const page = await this.uc.listChanges(query.cursor, query.limit);
+    return { items: page.items.map(present), nextCursor: page.nextCursor, hasMore: page.hasMore };
+  }
+
   @Get(':id')
   @RequirePermissions(PERM_READ)
   async get(@Param('id', idPipe) id: string) {
@@ -80,21 +116,27 @@ export class EstablishmentsController {
 
   @Patch(':id')
   @RequirePermissions(PERM_UPDATE)
+  @Idempotent()
   async update(
     @CurrentUserId() actorId: string,
     @Param('id', idPipe) id: string,
     @Body(new ZodValidationPipe(updateEstablishmentSchema)) body: EstablishmentChanges,
+    @IfMatchVersion() expectedVersion: number | undefined,
   ) {
-    return present(await this.uc.update(actorId, id, body));
+    return present(await presentingConflict(this.uc.update(actorId, id, body, expectedVersion)));
   }
 
   @Patch(':id/status')
   @RequirePermissions(PERM_DEACTIVATE)
+  @Idempotent()
   async setStatus(
     @CurrentUserId() actorId: string,
     @Param('id', idPipe) id: string,
     @Body(new ZodValidationPipe(establishmentStatusSchema)) body: { isActive: boolean },
+    @IfMatchVersion() expectedVersion: number | undefined,
   ) {
-    return present(await this.uc.setStatus(actorId, id, body.isActive));
+    return present(
+      await presentingConflict(this.uc.setStatus(actorId, id, body.isActive, expectedVersion)),
+    );
   }
 }
