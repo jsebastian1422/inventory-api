@@ -906,3 +906,96 @@ describe('CORS (sprint 004)', () => {
     expect(res.statusCode).toBe(200);
   });
 });
+
+describe('UUID case-insensitivity (sprint 006 cycle 3)', () => {
+  it('self-deactivation and self password reset with an uppercase id are still refused', async () => {
+    const roleId = await createRole(undefined, ['users.read', 'users.update', 'users.deactivate']);
+    const me = await tokenFor(roleId);
+    const upper = me.id.toUpperCase();
+    expect(upper).not.toBe(me.id);
+
+    const off = await call('PATCH', `/users/${upper}/status`, {
+      token: me.token,
+      body: { isActive: false },
+    });
+    const offLower = await call('PATCH', `/users/${me.id}/status`, {
+      token: me.token,
+      body: { isActive: false },
+    });
+    expect(off.status).toBe(409);
+    expect(off.body.code).toBe('SELF_DEACTIVATION');
+    expect(offLower.status).toBe(409);
+    expect(offLower.body.code).toBe('SELF_DEACTIVATION');
+
+    const reset = await call('POST', `/users/${upper}/reset-password`, {
+      token: me.token,
+      body: { newPassword: password() },
+    });
+    expect(reset.status).toBe(409);
+    expect(reset.body.code).toBe('USE_CHANGE_PASSWORD');
+    expect((await login(me.email, USER_PASSWORD)).status).toBe(200);
+  });
+
+  it('roleId in uppercase behaves like lowercase and responses carry lowercase ids', async () => {
+    const roleId = await createRole();
+    const otherRole = await createRole();
+    const email = `upper-${unique()}@example.test`;
+    const created = await call('POST', '/users', {
+      token: adminToken,
+      body: {
+        email,
+        password: USER_PASSWORD,
+        fullName: 'Mayusculas',
+        roleId: roleId.toUpperCase(),
+      },
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.role.id).toBe(roleId);
+    const patched = await call('PATCH', `/users/${created.body.id.toUpperCase()}`, {
+      token: adminToken,
+      body: { roleId: otherRole.toUpperCase() },
+    });
+    expect(patched.status).toBe(200);
+    expect(patched.body.id).toBe(created.body.id);
+    expect(patched.body.role.id).toBe(otherRole);
+    const same = await call('PATCH', `/users/${created.body.id}`, {
+      token: adminToken,
+      body: { roleId: otherRole.toUpperCase() },
+    });
+    expect(same.status).toBe(200);
+    expect(same.body.role.id).toBe(otherRole);
+  });
+
+  it('NUL (\\u0000) in any text input is a 400 VALIDATION_ERROR with the field, never a 500', async () => {
+    const nul = 'a\u0000b';
+    const loginEmail = await login(nul, USER_PASSWORD);
+    expect(loginEmail.status).toBe(400);
+    expect(loginEmail.body.code).toBe('VALIDATION_ERROR');
+    expect(loginEmail.body.details[0].field).toBe('email');
+    expect((await login('x@example.test', nul)).status).toBe(400);
+    const refresh = await call('POST', '/auth/refresh', { body: { refreshToken: nul } });
+    expect(refresh.status).toBe(400);
+    expect(refresh.body.details[0].field).toBe('refreshToken');
+    const user = await call('POST', '/users', {
+      token: adminToken,
+      body: {
+        email: `nul-${unique()}@example.test`,
+        password: USER_PASSWORD,
+        fullName: nul,
+        roleId: await createRole(),
+      },
+    });
+    expect(user.status).toBe(400);
+    expect(user.body.code).toBe('VALIDATION_ERROR');
+    expect(user.body.details[0].field).toBe('fullName');
+    const role = await call('POST', '/roles', { token: adminToken, body: { name: nul } });
+    expect(role.status).toBe(400);
+    expect(role.body.details[0].field).toBe('name');
+    const roleId = await createRole();
+    const perms = await call('PUT', `/roles/${roleId}/permissions`, {
+      token: adminToken,
+      body: { permissions: [nul] },
+    });
+    expect(perms.status).toBe(400);
+  });
+});

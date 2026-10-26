@@ -31,7 +31,7 @@ const PERM_DEACTIVATE = 'establishments.deactivate' satisfies EstablishmentPermi
 const idPipe = new ZodValidationPipe(idSchema);
 
 /** Public representation: adds the Google Maps link derived from the coordinates. */
-function present(e: Establishment) {
+export function present(e: Establishment) {
   return {
     id: e.id,
     name: e.name,

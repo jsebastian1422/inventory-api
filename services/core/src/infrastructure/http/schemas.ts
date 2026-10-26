@@ -27,11 +27,17 @@ import { BARCODE_MAX as LINE_BARCODE_MAX } from '../../domain/inventory-line/inv
 import { PRICE_PATTERN, QUANTITY_PATTERN } from '../../domain/shared/decimal.js';
 import { isValidDate } from '../../domain/shared/fields.js';
 
-export const idSchema = z.uuid();
+/** Text input must not carry NUL: PostgreSQL rejects it and it would surface as a 500. */
+export const text = () =>
+  z.string().refine((value) => !value.includes('\u0000'), {
+    message: 'No puede contener el carácter nulo',
+  });
+
+/** UUIDs are accepted in any case and normalized to lowercase before reaching the use cases. */
+export const idSchema = z.uuid().transform((value) => value.toLowerCase());
 
 /** Text limits apply after trimming outer spaces, as the domain stores trimmed text. */
-const phone = z
-  .string()
+const phone = text()
   .trim()
   .max(PHONE_MAX)
   .refine((value) => value.trim() === '' || PHONE_PATTERN.test(value.trim()), {
@@ -39,10 +45,10 @@ const phone = z
   });
 
 const fields = {
-  name: z.string().trim().max(NAME_MAX),
-  address: z.string().trim().max(ADDRESS_MAX),
-  city: z.string().trim().max(CITY_MAX),
-  department: z.string().trim().max(DEPARTMENT_MAX),
+  name: text().trim().max(NAME_MAX),
+  address: text().trim().max(ADDRESS_MAX),
+  city: text().trim().max(CITY_MAX),
+  department: text().trim().max(DEPARTMENT_MAX),
   latitude: z.number(),
   longitude: z.number(),
 };
@@ -70,13 +76,13 @@ export const establishmentStatusSchema = z.object({ isActive: z.boolean() });
 
 export const listEstablishmentsQuerySchema = z.object({
   status: z.enum(['active', 'inactive', 'all']).default('all'),
-  q: z.string().max(100).optional(),
+  q: text().max(100).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
   offset: z.coerce.number().int().min(0).default(0),
 });
 
 export const listChangesQuerySchema = z.object({
-  cursor: z.string().min(1).max(200).optional(),
+  cursor: text().min(1).max(200).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 
@@ -97,9 +103,9 @@ const date = z.string().refine(isValidDate, { message: 'Debe ser una fecha váli
 const forbiddenQuantityCurrent = z.never().optional();
 
 const categoryFields = {
-  code: z.string().trim().max(CATEGORY_CODE_MAX),
-  name: z.string().trim().max(CATEGORY_NAME_MAX),
-  description: z.string().trim().max(CATEGORY_DESCRIPTION_MAX),
+  code: text().trim().max(CATEGORY_CODE_MAX),
+  name: text().trim().max(CATEGORY_NAME_MAX),
+  description: text().trim().max(CATEGORY_DESCRIPTION_MAX),
 };
 
 export const createCategorySchema = z.object({
@@ -118,17 +124,17 @@ export const updateCategorySchema = z
 
 export const listCategoriesQuerySchema = z.object({
   status: statusQuery,
-  q: z.string().max(100).optional(),
+  q: text().max(100).optional(),
   limit: limitQuery,
   offset: offsetQuery,
 });
 
 const productFields = {
-  sku: z.string().trim().max(PRODUCT_SKU_MAX),
-  name: z.string().trim().max(PRODUCT_NAME_MAX),
-  description: z.string().trim().max(PRODUCT_DESCRIPTION_MAX).nullable().optional(),
-  brand: z.string().trim().max(PRODUCT_BRAND_MAX).nullable().optional(),
-  unit: z.string(),
+  sku: text().trim().max(PRODUCT_SKU_MAX),
+  name: text().trim().max(PRODUCT_NAME_MAX),
+  description: text().trim().max(PRODUCT_DESCRIPTION_MAX).nullable().optional(),
+  brand: text().trim().max(PRODUCT_BRAND_MAX).nullable().optional(),
+  unit: text(),
   categoryId: idSchema,
   price,
 };
@@ -149,7 +155,7 @@ export const updateProductSchema = z
 
 export const listProductsQuerySchema = z.object({
   status: statusQuery,
-  q: z.string().max(100).optional(),
+  q: text().max(100).optional(),
   categoryId: idSchema.optional(),
   limit: limitQuery,
   offset: offsetQuery,
@@ -157,11 +163,11 @@ export const listProductsQuerySchema = z.object({
 
 const inventoryFields = {
   establishmentId: idSchema,
-  name: z.string().trim().max(INVENTORY_NAME_MAX),
+  name: text().trim().max(INVENTORY_NAME_MAX),
   startDate: date,
   endDate: date,
-  origin: z.string().trim().max(INVENTORY_ORIGIN_MAX),
-  notes: z.string().trim().max(INVENTORY_NOTES_MAX).nullable().optional(),
+  origin: text().trim().max(INVENTORY_ORIGIN_MAX),
+  notes: text().trim().max(INVENTORY_NOTES_MAX).nullable().optional(),
 };
 
 export const createInventorySchema = z.object({ ...inventoryFields, id: idSchema.optional() });
@@ -179,13 +185,13 @@ export const updateInventorySchema = z
 
 export const listInventoriesQuerySchema = z.object({
   status: statusQuery,
-  q: z.string().max(100).optional(),
+  q: text().max(100).optional(),
   establishmentId: idSchema.optional(),
   limit: limitQuery,
   offset: offsetQuery,
 });
 
-const lineBarcode = z.string().trim().max(LINE_BARCODE_MAX);
+const lineBarcode = text().trim().max(LINE_BARCODE_MAX);
 
 export const createInventoryLineSchema = z.object({
   id: idSchema.optional(),
@@ -210,7 +216,38 @@ export const updateInventoryLineSchema = z
 export const listInventoryLinesQuerySchema = z.object({
   status: statusQuery,
   productId: idSchema.optional(),
-  barcode: z.string().max(LINE_BARCODE_MAX).optional(),
+  barcode: text().max(LINE_BARCODE_MAX).optional(),
   limit: limitQuery,
   offset: offsetQuery,
 });
+
+// ---- Users by establishment and stock search (sprint 006) ----
+
+export const assignmentPageQuerySchema = z.object({
+  includeRemoved: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  limit: limitQuery,
+  offset: offsetQuery,
+});
+
+export const userAssignmentsQuerySchema = z.object({
+  userId: idSchema,
+  includeRemoved: assignmentPageQuerySchema.shape.includeRemoved,
+  limit: limitQuery,
+  offset: offsetQuery,
+});
+
+/** Exactly one criterion: `barcode` (exact) or `q` (name or SKU); text limits apply after trimming. */
+export const stockSearchQuerySchema = z
+  .object({
+    establishmentId: idSchema,
+    barcode: text().trim().min(1).max(LINE_BARCODE_MAX).optional(),
+    q: text().trim().min(1).max(100).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    offset: offsetQuery,
+  })
+  .refine((v) => (v.barcode === undefined) !== (v.q === undefined), {
+    message: 'Indica exactamente un criterio: barcode o q',
+  });

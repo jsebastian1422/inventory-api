@@ -242,7 +242,8 @@ describe('authentication and live authorization (ADR-0001)', () => {
     const { rows } = await pool.query(
       `SELECT p.code FROM role_permissions rp JOIN roles r ON r.id = rp.role_id
        JOIN permissions p ON p.id = rp.permission_id
-       WHERE r.is_system AND p.module = 'establishments' ORDER BY p.code`,
+       WHERE r.is_system AND p.module = 'establishments'
+         AND p.code NOT IN ('establishments.assign', 'establishments.all') ORDER BY p.code`,
     );
     expect(rows.map((r) => r.code)).toEqual([...ALL].sort());
   });

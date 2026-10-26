@@ -107,6 +107,15 @@ export class PostgresEstablishmentRepository implements EstablishmentRepository 
     return rows[0] ? toEstablishment(rows[0]) : null;
   }
 
+  async findByIds(ids: readonly string[]): Promise<Establishment[]> {
+    const { rows } = await this.pool.query<EstablishmentRow>(
+      `SELECT ${COLUMNS} FROM establishments WHERE id = ANY($1::uuid[])
+       ORDER BY lower(name) COLLATE "und-x-icu", id`,
+      [ids],
+    );
+    return rows.map(toEstablishment);
+  }
+
   async list(filter: EstablishmentFilter): Promise<{ items: Establishment[]; total: number }> {
     const conditions: string[] = [];
     const params: unknown[] = [];

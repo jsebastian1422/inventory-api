@@ -72,24 +72,26 @@ npm run migrate:down   # revierte la ultima
 
 Leen `.env` si existe; sin `.env` funcionan igual si las variables `POSTGRES_*` estan en el entorno.
 
-Migraciones actuales (9):
+Migraciones actuales (11):
 
-| Migracion                       | Contenido                                                                              | `migrate:down` que la revierten |
-| ------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------- |
-| `identity-tables`               | roles, permissions, role_permissions, users, refresh_tokens                            | identity: 2 en total            |
-| `identity-seed`                 | permisos de usuarios/roles y rol de sistema "Administrador" con todos ellos            | (ver arriba)                    |
-| `establishments`                | tabla `establishments` (nombre unico sin distinguir mayusculas, checks de coordenadas) | establecimientos: 2 en total    |
-| `establishments-permissions`    | permisos `establishments.*` asignados al rol Administrador                             | (ver arriba)                    |
-| `establishments-sync`           | columnas `version` y `change_xid` e indice del feed de cambios en `establishments`     | sincronizacion: 2 en total      |
-| `idempotency-keys`              | tabla `idempotency_keys` (claves de idempotencia por usuario)                          | (ver arriba)                    |
-| `catalog`                       | tablas `categories`, `products` y `product_price_history`                              | catalogo: 3 en total            |
-| `inventories`                   | tablas `inventories`, `inventory_lines` e `inventory_line_history`                     | (ver arriba)                    |
-| `catalog-inventory-permissions` | 12 permisos `categories.*`, `products.*` e `inventories.*` asignados al Administrador  | (ver arriba)                    |
+| Migracion                       | Contenido                                                                                | `migrate:down` que la revierten |
+| ------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------- |
+| `identity-tables`               | roles, permissions, role_permissions, users, refresh_tokens                              | identity: 2 en total            |
+| `identity-seed`                 | permisos de usuarios/roles y rol de sistema "Administrador" con todos ellos              | (ver arriba)                    |
+| `establishments`                | tabla `establishments` (nombre unico sin distinguir mayusculas, checks de coordenadas)   | establecimientos: 2 en total    |
+| `establishments-permissions`    | permisos `establishments.*` asignados al rol Administrador                               | (ver arriba)                    |
+| `establishments-sync`           | columnas `version` y `change_xid` e indice del feed de cambios en `establishments`       | sincronizacion: 2 en total      |
+| `idempotency-keys`              | tabla `idempotency_keys` (claves de idempotencia por usuario)                            | (ver arriba)                    |
+| `catalog`                       | tablas `categories`, `products` y `product_price_history`                                | catalogo: 3 en total            |
+| `inventories`                   | tablas `inventories`, `inventory_lines` e `inventory_line_history`                       | (ver arriba)                    |
+| `catalog-inventory-permissions` | 12 permisos `categories.*`, `products.*` e `inventories.*` asignados al Administrador    | (ver arriba)                    |
+| `establishment-users`           | tabla `establishment_users` (asignaciones usuario-local con retiro logico)               | alcance por local: 2 en total   |
+| `scope-permissions`             | permisos `establishments.assign`, `establishments.all` y `stock.search` al Administrador | (ver arriba)                    |
 
 `migrate:down` revierte de una en una, en orden inverso. Cuantas hacen falta por modulo: sincronizacion 2
 (`idempotency-keys`, luego `establishments-sync`), establecimientos 2 (`establishments-permissions`, luego
-`establishments`) e identity 2 (`identity-seed`, luego `identity-tables`); el catalogo y los inventarios 3 (`catalog-inventory-permissions`, `inventories`, luego `catalog`); para volver a
-la BD vacia hacen falta 9. Revertir la semilla de identity falla si ya hay usuarios con el rol Administrador (la FK lo impide).
+`establishments`) e identity 2 (`identity-seed`, luego `identity-tables`); el catalogo y los inventarios 3 (`catalog-inventory-permissions`, `inventories`, luego `catalog`); el alcance por local 2 (`scope-permissions`, luego `establishment-users`); para volver a
+la BD vacia hacen falta 11. Revertir la semilla de identity falla si ya hay usuarios con el rol Administrador (la FK lo impide).
 
 Las migraciones cuyo `down` contiene `DROP` (todas las que eliminan tablas, columnas o indices) las aplica
 una persona, no los agentes: el hook de politica del proyecto bloquea esos comandos.
@@ -269,6 +271,62 @@ Orden de errores al editar: 400, 404, `VERSION_CONFLICT`, reglas de negocio, uni
 400 por orden de fechas cuando solo llega una de ellas se evalua contra la fecha guardada, por eso va despues del 404 y
 del `VERSION_CONFLICT`). Los POST y PATCH aceptan
 `Idempotency-Key`, los PATCH `If-Match` y los POST un `id` de cliente, como en Establecimientos.
+
+## Core: usuarios por local y busqueda de existencias (ADR-0004)
+
+Las asignaciones usuario-local viven en core (`establishment_users`, retiro logico, sin FK a `users`). Son
+administracion: **solo en linea**, sin `Idempotency-Key` ni `If-Match`. El **alcance** de un usuario se calcula en
+vivo en cada peticion: con `establishments.all`, todos los locales activos (`access: "all"`); sin el, solo los
+locales activos donde tiene una asignacion vigente (`access: "assigned"`). Desactivar un usuario o un local conserva
+las asignaciones pero no dan acceso mientras esten inactivos. Los permisos y endpoints de gestion (inventarios,
+productos, ...) siguen siendo globales: el alcance solo limita la busqueda y los feeds `/stock/...`.
+
+Permisos nuevos (en `GET /permissions` de identity; el Administrador los tiene): `establishments.assign`
+("Asignar y retirar usuarios de locales"), `establishments.all` ("Acceso a todos los locales") y `stock.search`
+("Buscar existencias en sus locales").
+
+| Metodo y ruta                                               | Permiso                  | Respuesta                                                    |
+| ----------------------------------------------------------- | ------------------------ | ------------------------------------------------------------ |
+| `PUT /establishments/:id/users/:userId`                     | `establishments.assign`  | 201 asignada / 200 ya estaba asignada (misma asignacion)     |
+| `DELETE /establishments/:id/users/:userId`                  | `establishments.assign`  | 204                                                          |
+| `GET /establishments/:id/users` (`includeRemoved`)          | `establishments.assign`  | `{ items, total, limit, offset }`; solo vigentes por defecto |
+| `GET /establishment-assignments?userId=` (`includeRemoved`) | `establishments.assign`  | igual, los locales de un usuario                             |
+| `GET /me/establishments`                                    | solo autenticado         | `{ items: [ {...establecimiento, access} ] }`                |
+| `GET /stock/search`                                         | `stock.search` + alcance | `{ items, total, limit, offset }`                            |
+| `GET /stock/inventories/changes`, `/stock/lines/changes`    | `stock.search`           | feed ADR-0002 con alcance                                    |
+| `GET /stock/products/changes`                               | `stock.search`           | feed ADR-0002 (catalogo completo, es global)                 |
+
+Asignacion: `{ id, establishmentId, user: { id, fullName, email, isActive }, assignedBy, assignedAt, removedBy,
+removedAt }`. Listados: `limit` 1-200 (def. 50), `offset`, `includeRemoved=true|false`, mas recientes primero.
+Reglas: solo usuarios y locales **activos** (409 `USER_INACTIVE` / `ESTABLISHMENT_INACTIVE`); repetir una asignacion
+vigente no duplica; retirar no borra (queda quien y cuando) y se puede volver a asignar; nadie se asigna ni se retira
+a si mismo (403 `SELF_ASSIGNMENT`); retirar sin asignacion vigente, 404. Orden de errores al asignar: 400, local
+(404, 409), usuario (404, 409), propio usuario (403). Auditoria: `establishment.user_assigned` y
+`establishment.user_removed` (`establishmentId`, `userId`, `actorId`); las busquedas no se auditan.
+
+**Busqueda** `GET /stock/search?establishmentId=<uuid>&barcode=<texto>` **o** `&q=<texto>` (exactamente uno, si no
+400): `barcode` es igualdad exacta (max 64); `q` busca sin distinguir mayusculas en nombre o SKU del producto (1-100
+tras recortar; `%` y `_` son literales). Recorre todos los inventarios **activos** del local (sin mirar fechas),
+lineas activas y productos activos; las lineas con cantidad `"0.000"` aparecen. Orden: nombre del producto,
+vencimiento (nulos al final), id de la linea; `limit` 1-100 (def. 50) y `offset`. Cada resultado:
+`{ lineId, inventoryId, inventoryName, barcode, expiresOn, quantityCurrent, product: { id, sku, name, unit, price } }`
+(decimales como texto, ADR-0003). Errores de alcance: local inexistente 404, inactivo 409 `ESTABLISHMENT_INACTIVE`,
+fuera del alcance 403 `ESTABLISHMENT_NOT_IN_SCOPE`.
+
+### Uso sin conexion con alcance (para el frontend)
+
+Los tres feeds `/stock/.../changes` usan los mismos parametros y la misma respuesta del ADR-0002 (`cursor`, `limit`
+1-500, `{ items, nextCursor, hasMore }`) pero **filtrados por alcance**:
+
+- Inventarios y lineas **dentro** del alcance llegan completos (misma representacion que `/inventories/changes` y
+  `/inventory-lines/changes`, sin campo extra). Los que estan **fuera** llegan solo como `{ "id": "...", "inScope": false }`:
+  nunca traen otros datos. Una linea esta en el alcance si su inventario pertenece a un local del alcance.
+- Los productos son el catalogo global: llegan completos, como en `/products/changes`.
+- El alcance se evalua al momento de cada consulta. Contrato del cliente: (a) al conectar, consultar
+  `GET /me/establishments`; (b) si su alcance cambio (local nuevo o retirado) o un inventario paso de fuera a dentro
+  del alcance, **reiniciar** (sin `cursor`) los feeds `/stock/inventories/changes` y `/stock/lines/changes`, porque ni
+  los inventarios ni las lineas cambian de posicion cuando cambia el alcance; (c) purgar localmente lo marcado `inScope: false` y las lineas de inventarios fuera del
+  alcance o inactivos (los inventarios y lineas inactivos llegan completos con `isActive: false`).
 
 ## Calidad
 

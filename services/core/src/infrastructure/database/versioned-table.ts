@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
+import type { ScopedRecord } from '../../domain/scope/scope.js';
 import type { ChangeBatch, ChangeCursor } from '../../domain/sync/change-cursor.js';
 import type { WriteOutcome } from '../../domain/sync/version.js';
 import type { StatusFilter } from '../../domain/establishment/establishment-repository.js';
@@ -114,6 +115,39 @@ export class VersionedTable<Row extends { id: string }, T> {
     const last = page.at(-1);
     return {
       items: page.map(this.map),
+      hasMore: rows.length > limit,
+      last: last ? { xid: last.change_xid_text, id: last.id } : null,
+    };
+  }
+
+  /**
+   * Feed like `listChanges` where each row is complete only when `inScopeSql` holds (ADR-0004);
+   * otherwise the page carries just its id. `inScopeSql` is fixed text and may use `$4`, the
+   * `uuid[]` of the establishments in scope. `scopeIds` is resolved by the caller in a previous
+   * query, so scope and rows are NOT read in the same statement: a change of assignment inside
+   * that millisecond window takes effect on the next request (accepted, H-3).
+   */
+  async listScopedChanges(
+    db: Db,
+    cursor: ChangeCursor | null,
+    limit: number,
+    inScopeSql: string,
+    scopeIds: readonly string[],
+  ): Promise<ChangeBatch<ScopedRecord<T>>> {
+    const { rows } = await db.query<Row & { change_xid_text: string; in_scope: boolean }>(
+      `SELECT ${this.columns}, change_xid::text AS change_xid_text, (${inScopeSql}) AS in_scope
+       FROM ${this.table}
+       WHERE change_xid < pg_snapshot_xmin(pg_current_snapshot())
+         AND ($1::xid8 IS NULL OR (change_xid, id) > ($1::xid8, $2::uuid))
+       ORDER BY change_xid, id LIMIT $3`,
+      [cursor?.xid ?? null, cursor?.id ?? null, limit + 1, scopeIds],
+    );
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      items: page.map((row): ScopedRecord<T> =>
+        row.in_scope ? { inScope: true, value: this.map(row) } : { inScope: false, id: row.id },
+      ),
       hasMore: rows.length > limit,
       last: last ? { xid: last.change_xid_text, id: last.id } : null,
     };

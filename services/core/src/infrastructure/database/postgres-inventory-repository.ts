@@ -243,3 +243,6 @@ export class PostgresInventoryRepository implements InventoryRepository {
     return this.table.listChanges(this.pool, cursor, limit);
   }
 }
+
+export { COLUMNS as INVENTORY_COLUMNS, toInventory };
+export type { InventoryRow };

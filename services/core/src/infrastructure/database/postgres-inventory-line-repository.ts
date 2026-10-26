@@ -381,3 +381,6 @@ export class PostgresInventoryLineRepository implements InventoryLineRepository 
     };
   }
 }
+
+export { COLUMNS as LINE_COLUMNS, toLine };
+export type { LineRow };

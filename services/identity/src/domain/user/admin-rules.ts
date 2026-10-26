@@ -21,7 +21,7 @@ export const USE_CHANGE_PASSWORD_CODE = 'USE_CHANGE_PASSWORD';
 
 /** Resetting one's own password would skip the current-password check; use change-password. */
 export function assertNotSelfPasswordReset(actorId: string, targetId: string): void {
-  if (actorId === targetId) {
+  if (actorId.toLowerCase() === targetId.toLowerCase()) {
     throw conflictError(
       'No puedes restablecer tu propia contraseña; usa /auth/change-password',
       USE_CHANGE_PASSWORD_CODE,

@@ -8,6 +8,12 @@ import { InventoryUseCases } from '../../application/inventories/inventory.use-c
 import { InventoryLineUseCases } from '../../application/inventory-lines/inventory-line.use-cases.js';
 import { ProductUseCases } from '../../application/products/product.use-cases.js';
 import { EstablishmentUseCases } from '../../application/establishments/establishment.use-cases.js';
+import { AssignmentUseCases } from '../../application/assignments/assignment.use-cases.js';
+import { ScopeUseCases } from '../../application/scope/scope.use-cases.js';
+import { StockUseCases } from '../../application/stock/stock.use-cases.js';
+import { PostgresAssignmentRepository } from '../database/postgres-assignment-repository.js';
+import { PostgresScopeReader } from '../database/postgres-scope-reader.js';
+import { PostgresStockRepository } from '../database/postgres-stock-repository.js';
 import { PostgresIdempotencyStore } from '../database/postgres-idempotency-store.js';
 import { PostgresAccessReader } from '../database/postgres-access-reader.js';
 import { PostgresCategoryRepository } from '../database/postgres-category-repository.js';
@@ -25,10 +31,14 @@ import { InventoriesController } from './inventories.controller.js';
 import { InventoryLinesController } from './inventory-lines.controller.js';
 import { ProductsController } from './products.controller.js';
 import { EstablishmentsController } from './establishments.controller.js';
+import { AssignmentsController } from './assignments.controller.js';
+import { MeController } from './me.controller.js';
+import { StockController } from './stock.controller.js';
 import { HealthController } from './health.controller.js';
 import { NestAuditLog } from './nest-audit-log.js';
 import {
   APP_CONFIG,
+  ASSIGNMENT_USE_CASES,
   AUDIT_LOG,
   AUTHORIZE_USE_CASE,
   CATEGORY_USE_CASES,
@@ -39,6 +49,8 @@ import {
   INVENTORY_LINE_USE_CASES,
   INVENTORY_USE_CASES,
   PRODUCT_USE_CASES,
+  SCOPE_USE_CASES,
+  STOCK_USE_CASES,
 } from './tokens.js';
 
 @Module({})
@@ -59,6 +71,9 @@ export class AppModule implements OnApplicationShutdown {
         ProductsController,
         InventoriesController,
         InventoryLinesController,
+        AssignmentsController,
+        MeController,
+        StockController,
       ],
       providers: [
         { provide: APP_CONFIG, useValue: config },
@@ -114,6 +129,35 @@ export class AppModule implements OnApplicationShutdown {
               new NestAuditLog(),
             ),
           inject: [DB_POOL],
+        },
+        {
+          provide: ASSIGNMENT_USE_CASES,
+          useFactory: (pool: Pool) =>
+            new AssignmentUseCases(
+              new PostgresAssignmentRepository(pool),
+              new PostgresEstablishmentRepository(pool),
+              new NestAuditLog(),
+            ),
+          inject: [DB_POOL],
+        },
+        {
+          provide: SCOPE_USE_CASES,
+          useFactory: (pool: Pool) =>
+            new ScopeUseCases(
+              new PostgresScopeReader(pool),
+              new PostgresEstablishmentRepository(pool),
+            ),
+          inject: [DB_POOL],
+        },
+        {
+          provide: STOCK_USE_CASES,
+          useFactory: (pool: Pool, scope: ScopeUseCases) =>
+            new StockUseCases(
+              scope,
+              new PostgresStockRepository(pool),
+              new PostgresProductRepository(pool),
+            ),
+          inject: [DB_POOL, SCOPE_USE_CASES],
         },
         { provide: AUDIT_LOG, useFactory: () => new NestAuditLog() },
         {

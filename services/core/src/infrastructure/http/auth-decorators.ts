@@ -20,3 +20,11 @@ export const CurrentUserId = createParamDecorator(
     return ctx.switchToHttp().getRequest<AuthenticatedRequest>().auth!.userId;
   },
 );
+
+/** Authenticated user with the live permissions loaded by AuthGuard (for scope decisions). */
+export const CurrentActor = createParamDecorator(
+  (_data: unknown, ctx: ExecutionContext): { userId: string; permissions: readonly string[] } => {
+    const { userId, permissions } = ctx.switchToHttp().getRequest<AuthenticatedRequest>().auth!;
+    return { userId, permissions };
+  },
+);

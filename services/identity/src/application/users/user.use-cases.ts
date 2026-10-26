@@ -185,7 +185,7 @@ export class SetUserStatusUseCase {
           await users.countActiveSystemRoleUsers(id),
           'desactivar al',
         );
-        if (actor.id === id) {
+        if (actor.id.toLowerCase() === id.toLowerCase()) {
           throw conflictError('No puedes desactivar tu propio usuario', 'SELF_DEACTIVATION');
         }
       }

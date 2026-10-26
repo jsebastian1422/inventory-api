@@ -34,7 +34,7 @@ const PERM_DEACTIVATE = 'inventories.deactivate' satisfies InventoryPermission;
 
 const idPipe = new ZodValidationPipe(idSchema);
 
-function present(i: Inventory) {
+export function present(i: Inventory) {
   return {
     id: i.id,
     establishmentId: i.establishmentId,

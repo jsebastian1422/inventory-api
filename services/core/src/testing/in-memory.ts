@@ -40,6 +40,10 @@ export class InMemoryEstablishmentRepository implements EstablishmentRepository 
     return this.rows.get(id) ?? null;
   }
 
+  async findByIds(ids: readonly string[]): Promise<Establishment[]> {
+    return ids.flatMap((id) => this.rows.get(id) ?? []);
+  }
+
   async list(filter: EstablishmentFilter) {
     const q = filter.q?.toLowerCase();
     const all = [...this.rows.values()]

@@ -63,3 +63,16 @@ export const INVENTORY_PERMISSIONS = [
 ] as const;
 
 export type InventoryPermission = (typeof INVENTORY_PERMISSIONS)[number];
+
+/** Scope permissions (sprint 006, ADR-0004): assign users to establishments and see all of them. */
+export const ESTABLISHMENT_SCOPE_PERMISSIONS = [
+  'establishments.assign',
+  'establishments.all',
+] as const;
+
+export type EstablishmentScopePermission = (typeof ESTABLISHMENT_SCOPE_PERMISSIONS)[number];
+
+/** Permissions of the stock search (services/core): search and offline feeds, limited by scope. */
+export const STOCK_PERMISSIONS = ['stock.search'] as const;
+
+export type StockPermission = (typeof STOCK_PERMISSIONS)[number];

@@ -19,6 +19,8 @@ export interface EstablishmentRepository {
    */
   create(data: EstablishmentData, id?: string): Promise<Establishment>;
   findById(id: string): Promise<Establishment | null>;
+  /** The establishments with those ids (any status), ordered like `list`. Unknown ids are ignored. */
+  findByIds(ids: readonly string[]): Promise<Establishment[]>;
   /** Ordered by name with ICU linguistic collation (case-insensitive), ties broken by id; `total` ignores limit/offset. */
   list(filter: EstablishmentFilter): Promise<{ items: Establishment[]; total: number }>;
   /**

@@ -2,15 +2,25 @@ import { z } from 'zod';
 import { ROLE_NAME_MAX } from '../../domain/role/role-rules.js';
 import { FULL_NAME_MAX } from '../../domain/user/user.js';
 
-export const idSchema = z.uuid();
+/**
+ * Text input must not carry NUL: PostgreSQL rejects it and it would surface as a 500. Replicated
+ * from core (shared does not depend on zod and identity/core keep their HTTP layers independent).
+ */
+export const text = () =>
+  z.string().refine((value) => !value.includes('\u0000'), {
+    message: 'No puede contener el carácter nulo',
+  });
 
-export const loginSchema = z.object({ email: z.string().max(254), password: z.string().max(256) });
-export const refreshSchema = z.object({ refreshToken: z.string().min(1).max(512) });
+/** UUIDs are canonicalised to lowercase so identity comparisons cannot be bypassed by case. */
+export const idSchema = z.uuid().transform((value) => value.toLowerCase());
+
+export const loginSchema = z.object({ email: text().max(254), password: text().max(256) });
+export const refreshSchema = z.object({ refreshToken: text().min(1).max(512) });
 export const changePasswordSchema = z.object({
-  currentPassword: z.string().max(256),
-  newPassword: z.string().max(256),
+  currentPassword: text().max(256),
+  newPassword: text().max(256),
 });
-export const resetPasswordSchema = z.object({ newPassword: z.string().max(256) });
+export const resetPasswordSchema = z.object({ newPassword: text().max(256) });
 
 export const listUsersQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -18,32 +28,32 @@ export const listUsersQuerySchema = z.object({
 });
 
 export const createUserSchema = z.object({
-  email: z.string().max(254),
-  password: z.string().max(256),
-  fullName: z.string().max(FULL_NAME_MAX),
-  roleId: z.uuid(),
+  email: text().max(254),
+  password: text().max(256),
+  fullName: text().max(FULL_NAME_MAX),
+  roleId: idSchema,
 });
 
 export const updateUserSchema = z
   .object({
-    email: z.string().max(254).optional(),
-    fullName: z.string().max(FULL_NAME_MAX).optional(),
-    roleId: z.uuid().optional(),
+    email: text().max(254).optional(),
+    fullName: text().max(FULL_NAME_MAX).optional(),
+    roleId: idSchema.optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: 'Indica al menos un campo a modificar' });
 
 export const userStatusSchema = z.object({ isActive: z.boolean() });
 
 export const createRoleSchema = z.object({
-  name: z.string().max(ROLE_NAME_MAX),
-  description: z.string().max(1000).optional(),
+  name: text().max(ROLE_NAME_MAX),
+  description: text().max(1000).optional(),
 });
 export const updateRoleSchema = z
   .object({
-    name: z.string().max(ROLE_NAME_MAX).optional(),
-    description: z.string().max(1000).optional(),
+    name: text().max(ROLE_NAME_MAX).optional(),
+    description: text().max(1000).optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: 'Indica al menos un campo a modificar' });
 export const rolePermissionsSchema = z.object({
-  permissions: z.array(z.string().max(100)).max(500),
+  permissions: z.array(text().max(100)).max(500),
 });

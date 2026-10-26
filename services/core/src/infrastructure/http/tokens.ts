@@ -9,3 +9,6 @@ export const CATEGORY_USE_CASES = Symbol('CATEGORY_USE_CASES');
 export const PRODUCT_USE_CASES = Symbol('PRODUCT_USE_CASES');
 export const INVENTORY_USE_CASES = Symbol('INVENTORY_USE_CASES');
 export const INVENTORY_LINE_USE_CASES = Symbol('INVENTORY_LINE_USE_CASES');
+export const ASSIGNMENT_USE_CASES = Symbol('ASSIGNMENT_USE_CASES');
+export const SCOPE_USE_CASES = Symbol('SCOPE_USE_CASES');
+export const STOCK_USE_CASES = Symbol('STOCK_USE_CASES');

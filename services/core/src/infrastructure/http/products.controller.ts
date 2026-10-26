@@ -31,7 +31,7 @@ const PERM_DEACTIVATE = 'products.deactivate' satisfies ProductPermission;
 
 const idPipe = new ZodValidationPipe(idSchema);
 
-function present(p: Product) {
+export function present(p: Product) {
   return {
     id: p.id,
     sku: p.sku,
