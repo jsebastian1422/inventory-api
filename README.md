@@ -328,6 +328,73 @@ Los tres feeds `/stock/.../changes` usan los mismos parametros y la misma respue
   los inventarios ni las lineas cambian de posicion cuando cambia el alcance; (c) purgar localmente lo marcado `inScope: false` y las lineas de inventarios fuera del
   alcance o inactivos (los inventarios y lineas inactivos llegan completos con `isActive: false`).
 
+## Core: carrito de compras por local
+
+Cada usuario arma carritos en un local de su **alcance** (ADR-0004, evaluado en vivo en cada escritura). El carrito
+guarda **lineas de inventario** (lotes) con una cantidad; solo **valida** existencias, no las reserva ni las
+descuenta (dos carritos pueden contener todo el lote). El precio no se congela: se lee del producto al consultar.
+
+Permisos nuevos (en `GET /permissions` de identity; el Administrador los tiene): `carts.use` ("Crear y gestionar sus
+carritos") y `carts.read` ("Consultar carritos de otros usuarios").
+
+| Metodo y ruta                  | Permiso                                                    | Respuesta                                                                                                                                 |
+| ------------------------------ | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /carts`                  | `carts.use`                                                | `{ id?, establishmentId }` -> 201 carrito `open`                                                                                          |
+| `GET /carts`                   | `carts.use` (propios)                                      | `{ items, total, limit, offset }`; filtros `status`, `establishmentId`; `userId` (otro usuario) exige `carts.read` + `establishments.all` |
+| `GET /carts/changes`           | `carts.use`                                                | feed ADR-0002 de los carritos propios                                                                                                     |
+| `GET /carts/:id`               | `carts.use` (propio) o `carts.read` + `establishments.all` | encabezado + items activos + `total` + `unavailableCount`                                                                                 |
+| `PATCH /carts/:id/status`      | `carts.use`                                                | `{ status: "cancelled" }`; `If-Match` opcional                                                                                            |
+| `POST /carts/:id/items`        | `carts.use`                                                | `{ id?, inventoryLineId, quantity }` -> 201 item nuevo / 200 sumado o reactivado                                                          |
+| `GET /cart-items/changes`      | `carts.use`                                                | feed ADR-0002 de los items de carritos propios                                                                                            |
+| `PATCH /cart-items/:id`        | `carts.use`                                                | `{ quantity }` fija (no suma) la cantidad                                                                                                 |
+| `PATCH /cart-items/:id/status` | `carts.use`                                                | `{ isActive }` quita (`false`) o reactiva (`true`)                                                                                        |
+
+Representaciones: carrito `{ id, establishmentId, createdBy, status, cancelledBy, cancelledAt, version, createdAt,
+updatedAt }`; item `{ id, cartId, inventoryLineId, quantity, isActive, version, createdAt, updatedAt }`. Detalle
+(`GET /carts/:id`): los campos del carrito mas `items: [ { id, version, product: { id, sku, name, unit, price },
+line: { id, barcode, expiresOn, quantityCurrent }, quantity, subtotal, available, unavailableReason } ]`, `total` y
+`unavailableCount`. Todos los montos y cantidades son **texto** (ADR-0003); `subtotal = round(quantity x price, 2)`
+(mitad hacia arriba) y `total` (suma de subtotales de los items **disponibles**) se calculan en SQL.
+`unavailableReason`: `LINE_INACTIVE`, `INVENTORY_INACTIVE`, `PRODUCT_INACTIVE` o `INSUFFICIENT_STOCK` (la cantidad del
+carrito supera `quantityCurrent` del lote); un item no disponible no suma al total y no se puede aumentar.
+
+Reglas:
+
+- `quantity`: texto decimal mayor que 0 con hasta 3 decimales (numero JSON, 0, negativos o mas decimales: 400).
+- Agregar: carrito propio **abierto**; la linea debe ser de un inventario **del mismo local** (409
+  `CART_LINE_OTHER_ESTABLISHMENT`), con linea, inventario y producto activos (409 `INVENTORY_LINE_INACTIVE`,
+  `INVENTORY_INACTIVE`, `PRODUCT_INACTIVE`); la cantidad resultante no puede superar la existencia del lote (409
+  `INSUFFICIENT_STOCK`, `details: [ { inventoryLineId, available, requested } ]`). Si la linea ya esta en el carrito
+  se suma (item activo) o se reactiva con la nueva cantidad (item quitado): un solo item por linea.
+- `PATCH /cart-items/:id` y reactivar aplican las mismas validaciones; quitar siempre se permite en un carrito
+  abierto. Pedir el estado o la cantidad actual no cambia la version ni genera evento.
+- Cancelar solo desde `open`; repetirlo responde 200 sin cambios. Con el carrito cancelado, toda escritura de items es
+  409 `CART_NOT_OPEN`.
+- Acceso: carrito ajeno sin `carts.read` + `establishments.all` -> 404 `CART_NOT_FOUND` (`CART_ITEM_NOT_FOUND` en las
+  rutas de items); con ambos, solo lectura y cualquier escritura es 403 `CART_READ_ONLY`. Si el creador pierde el
+  local: 403 `ESTABLISHMENT_NOT_IN_SCOPE`; si el local se desactiva: 409 `ESTABLISHMENT_INACTIVE`.
+- Lectura del creador sin `carts.use`: con `carts.read` + `establishments.all` pero sin `carts.use` puede leer su
+  propio carrito por id (`GET /carts/:id`), pero no listarlos (`GET /carts` exige `carts.use`). Es el comportamiento
+  actual, pendiente de evaluacion por Sebastian.
+- Idempotencia y permisos: los endpoints idempotentes cuyo permiso se evalua en el caso de uso (no en el guard) declaran
+  `@Idempotent({ authorize })`; cada replay de una `Idempotency-Key` reevalua la autorizacion vigente (permisos y
+  alcance en vivo) antes de devolver la respuesta guardada, y puede responder 403/404/409 en lugar de ella. Los
+  endpoints con permiso en el guard usan `@Idempotent()` sin `authorize`. Todo endpoint idempotente futuro con permiso
+  en el caso de uso debe declarar `authorize`.
+- Montos: `total` y todo subtotal salen siempre como texto con 2 decimales (`"0.00"` si no hay items disponibles).
+- Orden de errores: 400, 404, 403, `VERSION_CONFLICT`, 409 del estado del carrito, 409 de la validez del lote, 409 de
+  existencias, id repetido (`CART_ID_TAKEN`, `CART_ITEM_ID_TAKEN`).
+- Concurrencia: cada escritura bloquea el carrito y luego producto, inventario y linea (mismo orden que el 005); dos
+  agregados simultaneos de la misma linea suman exactamente y nunca superan la existencia.
+- Auditoria: `cart.created`, `cart.cancelled`, `cart_item.added` (nuevo o sumado), `cart_item.updated`,
+  `cart_item.removed`, `cart_item.reactivated` con `cartId`, `itemId` y `actorId`.
+
+Sin conexion (ADR-0002): `id` de cliente en `POST /carts` y `POST /carts/:id/items`, `Idempotency-Key` en todas las
+escrituras, `If-Match` en los `PATCH`; cada escritura efectiva sube `version` y tambien la del carrito (para que su
+feed refleje el cambio de contenido). `GET /carts/changes` y `GET /cart-items/changes` devuelven solo carritos (e
+items) **creados por el usuario**, abiertos y cancelados, con el contrato de cursor del ADR-0002 y sin marcas
+`inScope`. Las existencias se validan al sincronizar: un item creado sin conexion puede ser rechazado (409).
+
 ## Calidad
 
 ```bash

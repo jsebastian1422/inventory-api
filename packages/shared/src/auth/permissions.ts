@@ -76,3 +76,8 @@ export type EstablishmentScopePermission = (typeof ESTABLISHMENT_SCOPE_PERMISSIO
 export const STOCK_PERMISSIONS = ['stock.search'] as const;
 
 export type StockPermission = (typeof STOCK_PERMISSIONS)[number];
+
+/** Permissions of the carts module (services/core, sprint 007): own carts and read-only access to others'. */
+export const CART_PERMISSIONS = ['carts.use', 'carts.read'] as const;
+
+export type CartPermission = (typeof CART_PERMISSIONS)[number];

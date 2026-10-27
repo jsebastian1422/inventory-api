@@ -121,6 +121,34 @@ export class VersionedTable<Row extends { id: string }, T> {
   }
 
   /**
+   * Feed like `listChanges` limited to the rows where `conditionSql` holds. `conditionSql` is fixed
+   * text that may use `$4`, the single parameter `filterValue`.
+   */
+  async listFilteredChanges(
+    db: Db,
+    cursor: ChangeCursor | null,
+    limit: number,
+    conditionSql: string,
+    filterValue: unknown,
+  ): Promise<ChangeBatch<T>> {
+    const { rows } = await db.query<Row & { change_xid_text: string }>(
+      `SELECT ${this.columns}, change_xid::text AS change_xid_text FROM ${this.table}
+       WHERE change_xid < pg_snapshot_xmin(pg_current_snapshot())
+         AND ($1::xid8 IS NULL OR (change_xid, id) > ($1::xid8, $2::uuid))
+         AND (${conditionSql})
+       ORDER BY change_xid, id LIMIT $3`,
+      [cursor?.xid ?? null, cursor?.id ?? null, limit + 1, filterValue],
+    );
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      items: page.map(this.map),
+      hasMore: rows.length > limit,
+      last: last ? { xid: last.change_xid_text, id: last.id } : null,
+    };
+  }
+
+  /**
    * Feed like `listChanges` where each row is complete only when `inScopeSql` holds (ADR-0004);
    * otherwise the page carries just its id. `inScopeSql` is fixed text and may use `$4`, the
    * `uuid[]` of the establishments in scope. `scopeIds` is resolved by the caller in a previous

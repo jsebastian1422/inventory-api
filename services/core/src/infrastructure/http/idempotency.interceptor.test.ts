@@ -1,4 +1,5 @@
 import type { CallHandler, ExecutionContext } from '@nestjs/common';
+import type { ModuleRef, Reflector } from '@nestjs/core';
 import { lastValueFrom, of, throwError } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 import type { AuditLog } from '../../domain/shared/audit-log.js';
@@ -9,7 +10,7 @@ import {
   type IdempotencyStore,
   type ReserveResult,
 } from '../../domain/sync/idempotency.js';
-import { IdempotencyInterceptor } from './idempotency.interceptor.js';
+import { IdempotencyInterceptor, type ReplayAuthorization } from './idempotency.interceptor.js';
 
 const KEY = '0b7f1c9e-5a2d-4e8b-9c3a-1f2e3d4c5b6a';
 
@@ -256,5 +257,66 @@ describe('IdempotencyInterceptor', () => {
     const { run, warns } = setup(store);
     await expect(run({}, ok({ id: 1 }))).resolves.toEqual({ id: 1 });
     expect(warns.map((w) => w.event)).toEqual(['idempotency.purge_failed']);
+  });
+});
+
+describe('IdempotencyInterceptor replay authorization', () => {
+  const SERVICE = Symbol('service');
+  const handlerFn = () => undefined;
+
+  function build(check: ReplayAuthorization<{ name: string }>['check']) {
+    const store = new MemoryStore();
+    const log: AuditLog = { info: () => undefined, warn: () => undefined };
+    const authorization: ReplayAuthorization<{ name: string }> = { token: SERVICE, check };
+    const reflector = { get: vi.fn(() => authorization) } as unknown as Reflector;
+    const moduleRef = { get: vi.fn(() => ({ name: 'svc' })) } as unknown as ModuleRef;
+    const interceptor = new IdempotencyInterceptor(store, log, reflector, moduleRef);
+    const reply = { statusCode: 201, status: vi.fn() };
+    reply.status.mockImplementation((code: number) => {
+      reply.statusCode = code;
+      return reply;
+    });
+    const req = {
+      headers: { 'idempotency-key': KEY },
+      method: 'POST',
+      url: '/things',
+      body: {},
+      params: { id: 'abc' },
+      auth: { userId: 'u1', permissions: ['x'] },
+    };
+    const context = {
+      switchToHttp: () => ({ getRequest: () => req, getResponse: () => reply }),
+      getHandler: () => handlerFn,
+    } as unknown as ExecutionContext;
+    const run = (handler: () => ReturnType<CallHandler['handle']>) =>
+      interceptor.intercept(context, { handle: handler }).then((obs) => lastValueFrom(obs));
+    return { run, moduleRef };
+  }
+
+  it('does not authorize a new request (the use case does) but does authorize a replay', async () => {
+    const check = vi.fn(() => Promise.resolve());
+    const { run, moduleRef } = build(check);
+    await run(ok({ id: 1 }));
+    expect(check).not.toHaveBeenCalled();
+    const handler = ok({ id: 2 });
+    await expect(run(handler)).resolves.toEqual({ id: 1 });
+    expect(moduleRef.get).toHaveBeenCalledWith(SERVICE, { strict: false });
+    expect(check).toHaveBeenCalledWith(
+      { name: 'svc' },
+      { userId: 'u1', permissions: ['x'] },
+      expect.objectContaining({ params: { id: 'abc' } }),
+    );
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('a denied replay answers the authorization error, not the stored response', async () => {
+    const denied = new DomainError('forbidden', 'No');
+    let allow = true;
+    const { run } = build(() => (allow ? Promise.resolve() : Promise.reject(denied)));
+    await run(ok({ id: 1 }));
+    allow = false;
+    await expect(run(ok({ id: 2 }))).rejects.toBe(denied);
+    allow = true;
+    await expect(run(ok({ id: 3 }))).resolves.toEqual({ id: 1 });
   });
 });

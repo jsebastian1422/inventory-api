@@ -251,3 +251,28 @@ export const stockSearchQuerySchema = z
   .refine((v) => (v.barcode === undefined) !== (v.q === undefined), {
     message: 'Indica exactamente un criterio: barcode o q',
   });
+
+// ---- Carts (sprint 007) ----
+
+/** `id` is the optional client-generated identifier (offline creation). */
+export const createCartSchema = z.object({ id: idSchema.optional(), establishmentId: idSchema });
+
+/** The only transition is to `cancelled`. */
+export const cartStatusSchema = z.object({ status: z.literal('cancelled') });
+
+export const listCartsQuerySchema = z.object({
+  status: z.enum(['open', 'cancelled']).optional(),
+  establishmentId: idSchema.optional(),
+  userId: idSchema.optional(),
+  limit: limitQuery,
+  offset: offsetQuery,
+});
+
+/** The quantity is exact decimal text (ADR-0003); `> 0` is checked by the domain. */
+export const addCartItemSchema = z.object({
+  id: idSchema.optional(),
+  inventoryLineId: idSchema,
+  quantity,
+});
+
+export const updateCartItemSchema = z.object({ quantity });

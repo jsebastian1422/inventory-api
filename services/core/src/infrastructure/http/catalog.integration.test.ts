@@ -308,7 +308,8 @@ describe('schema (CA-1) and permissions catalog (CA-2)', () => {
     for (const fk of fks) expect(fk.def).not.toMatch(/ON DELETE (CASCADE|SET)/);
     expect(constraints.rows.some((r) => r.def.includes('actor_id'))).toBe(false);
     const indexes = await pool.query<{ indexname: string }>(
-      `SELECT indexname FROM pg_indexes WHERE indexname LIKE '%change_xid_id_idx'
+      `SELECT indexname FROM pg_indexes WHERE (indexname LIKE '%change_xid_id_idx'
+           AND tablename IN ('categories','products','inventories','inventory_lines','establishments'))
          OR indexname IN ('categories_name_lower_key','products_sku_lower_key')`,
     );
     expect(indexes.rows.map((r) => r.indexname).sort()).toEqual(
