@@ -395,6 +395,66 @@ feed refleje el cambio de contenido). `GET /carts/changes` y `GET /cart-items/ch
 items) **creados por el usuario**, abiertos y cancelados, con el contrato de cursor del ADR-0002 y sin marcas
 `inScope`. Las existencias se validan al sincronizar: un item creado sin conexion puede ser rechazado (409).
 
+## Core: venta del carrito y factura interna
+
+`POST /carts/:id/checkout` convierte un carrito **abierto** en una venta en **una sola transaccion**: valida todos los
+items activos, descuenta `quantityCurrent` de cada lote (la cantidad inicial no cambia) con una fila `sale` en el
+historico de la linea, toma el siguiente numero de factura del local y marca el carrito `sold`. Todo o nada: si
+algo falla no cambia nada (ni existencias, ni historico, ni carrito, ni numero). La venta es **inmutable** (sin endpoints
+de edicion, anulacion ni devolucion). Sin impuestos, medios de pago ni factura electronica DIAN (otro sprint).
+
+Permisos nuevos (en `GET /permissions` de identity; el Administrador los tiene): `sales.create` ("Vender sus carritos
+y consultar sus ventas") y `sales.read` ("Consultar ventas de sus locales").
+
+| Metodo y ruta              | Permiso                                 | Respuesta                                                                                                                  |
+| -------------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `POST /carts/:id/checkout` | `sales.create`                          | `{ id?, customer?: { docType, docNumber, name, email?, phone? } }` -> 201 venta; `If-Match` opcional (version del carrito) |
+| `GET /sales`               | `sales.create` (propias) o `sales.read` | `{ items, total, limit, offset }`; filtros `establishmentId`, `sellerId`, `from`, `to` (AAAA-MM-DD, dias UTC, inclusivos)  |
+| `GET /sales/changes`       | `sales.create`                          | feed ADR-0002 de las ventas propias (con items)                                                                            |
+| `GET /sales/:id`           | `sales.create` (propia) o `sales.read`  | venta con items; ajena o fuera de alcance -> 404 `SALE_NOT_FOUND`                                                          |
+
+Venta: `{ id, number, establishmentId, cartId, sellerId, customer: { docType, docNumber, name, email, phone } | null,
+customerLabel: "Consumidor final" | <nombre>, items: [ { id, inventoryLineId, productId, sku, productName, unit,
+barcode, expiresOn, unitPrice, quantity, subtotal } ], total, createdAt, version }`. Montos y cantidades son **texto**
+(ADR-0003); `subtotal = round(quantity x unitPrice, 2)` y `total = suma de subtotales` se calculan en SQL
+(`numeric(18,2)`; si no cabe: 409 `SALE_AMOUNT_OUT_OF_RANGE`). El precio, SKU, nombre, unidad, codigo de barras y
+vencimiento quedan **congelados** en la venta.
+
+Reglas:
+
+- Vende solo el **creador** del carrito, con `sales.create`, el local en su alcance (403 `ESTABLISHMENT_NOT_IN_SCOPE`) y
+  activo (409 `ESTABLISHMENT_INACTIVE`). Carrito ajeno o inexistente: 404 `CART_NOT_FOUND`; `sold` o `cancelled`: 409
+  `CART_NOT_OPEN`; sin items activos: 409 `CART_EMPTY` (los items quitados se ignoran).
+- Si algun item activo no esta disponible: 409 `SALE_ITEMS_UNAVAILABLE` con `details: [ { itemId, inventoryLineId,
+reason, available, requested } ]` para **cada** item afectado. `reason`: `LINE_INACTIVE`, `INVENTORY_INACTIVE`,
+  `PRODUCT_INACTIVE`, `LINE_OTHER_ESTABLISHMENT` o `INSUFFICIENT_STOCK`.
+- Comprador opcional: sin `customer` la venta es "Consumidor final". Si se informa: `docType` (`CC`, `CE`, `NIT`, `PAS`,
+  `TI`), `docNumber` (1-20 letras, digitos y guion; el guion solo entre caracteres alfanumericos, p. ej. NIT `900123456-7`; se guarda tal como llega) y `name` (1-150) obligatorios juntos; `email` (maximo 254) y `phone`
+  (patron de establecimientos) opcionales. Los datos del comprador no se escriben en los logs.
+- Numeracion (ADR-0005): consecutivo por local desde 1, asignado por el servidor dentro de la transaccion con
+  `sale_counters` (fila bloqueada hasta el commit): sin huecos ni repetidos, y una venta fallida no consume numero. El
+  cliente sin conexion nunca asigna numeros.
+- Orden de errores: 400, 403 (`sales.create`), 404, alcance (404/409/403), `VERSION_CONFLICT`, 409 estado del carrito,
+  `CART_EMPTY`, `SALE_ITEMS_UNAVAILABLE`, `SALE_AMOUNT_OUT_OF_RANGE`, `SALE_ID_TAKEN`.
+- Concurrencia: bloquea carrito, local (FOR SHARE), productos e inventarios (FOR SHARE) y lineas (FOR UPDATE, por id) y
+  al final el contador; dos checkouts del mismo carrito dan una venta y un 409 `CART_NOT_OPEN`; dos carritos sobre un
+  lote con existencia para uno dan una venta y un 409 `SALE_ITEMS_UNAVAILABLE`.
+- Lectura (R-1): el vendedor (`sales.create`) ve sus ventas; con `sales.read` se ven las de los locales del alcance
+  (con `establishments.all`, todas). Una venta que no puedes ver es 404. `GET /sales` sin ninguno de los dos permisos:
+  403; `sellerId` ajeno exige `sales.read`.
+- Carrito vendido: `status: "sold"`, `soldAt`, `soldBy` y `saleId` (los carritos agregan estos tres campos, nulos si no
+  estan vendidos; `GET /carts?status=sold` lo filtra). Toda escritura de carrito o items: 409 `CART_NOT_OPEN`.
+- Historico de la linea (`GET /inventory-lines/:id/history`): motivo `sale` con `saleId` (la respuesta agrega `saleId`,
+  `null` en `created` e `initial_adjusted`).
+- Auditoria: `sale.created` (`saleId`, `number`, `establishmentId`, `sellerId`, `cartId`, `total`, `actorId`) e
+  `inventory_line.quantity_sold` por linea (`saleId`, `inventoryLineId`, `quantity`, `actorId`).
+
+Sin conexion (ADR-0002): `id` de cliente (opcional) en el cuerpo del checkout, que pasa a ser el id de la venta (409
+`SALE_ID_TAKEN` si ya existe), e `Idempotency-Key`: el reenvio devuelve la misma venta sin descontar de nuevo, sin nuevo
+numero ni evento, y reevalua el permiso, la propiedad y el alcance vigentes (puede responder 403/404/409). La
+venta se valida con las existencias al sincronizar; si falla, el carrito sigue abierto. `GET /sales/changes` devuelve
+solo las ventas del vendedor.
+
 ## Calidad
 
 ```bash

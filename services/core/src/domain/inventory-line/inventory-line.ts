@@ -45,7 +45,7 @@ export interface NewInventoryLine extends InventoryLineData {
   readonly productId: string;
 }
 
-export type LineHistoryReason = 'created' | 'initial_adjusted';
+export type LineHistoryReason = 'created' | 'initial_adjusted' | 'sale';
 
 /** One row of the quantity history (read only). `*Before` is null on `created`. */
 export interface LineHistoryEntry {
@@ -56,6 +56,8 @@ export interface LineHistoryEntry {
   readonly currentBefore: string | null;
   readonly currentAfter: string;
   readonly delta: string | null;
+  /** The sale that discounted the lot; only for the `sale` reason (sprint 008). */
+  readonly saleId: string | null;
   readonly actorId: string;
   readonly changedAt: Date;
 }

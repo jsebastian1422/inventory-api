@@ -1,7 +1,7 @@
 import { DomainError, forbiddenError } from '../shared/errors.js';
 import { hasFullAccess, type Actor } from '../scope/scope.js';
 
-export const CART_STATUSES = ['open', 'cancelled'] as const;
+export const CART_STATUSES = ['open', 'cancelled', 'sold'] as const;
 export type CartStatus = (typeof CART_STATUSES)[number];
 
 export const PERM_CART_USE = 'carts.use';
@@ -15,6 +15,10 @@ export interface Cart {
   readonly status: CartStatus;
   readonly cancelledBy: string | null;
   readonly cancelledAt: Date | null;
+  /** Set when the cart became a sale (sprint 008); `saleId` is that sale. */
+  readonly soldBy: string | null;
+  readonly soldAt: Date | null;
+  readonly saleId: string | null;
   readonly version: number;
   readonly createdAt: Date;
   readonly updatedAt: Date;

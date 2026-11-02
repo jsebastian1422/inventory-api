@@ -1065,6 +1065,7 @@ describe('inventory lines and quantities (CA-8, CA-9, CA-10)', () => {
       currentBefore: null,
       currentAfter: '10.500',
       delta: null,
+      saleId: null,
       actorId: admin.userId,
       changedAt: expect.any(String),
     });

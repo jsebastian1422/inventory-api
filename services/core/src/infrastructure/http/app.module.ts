@@ -12,10 +12,12 @@ import { AssignmentUseCases } from '../../application/assignments/assignment.use
 import { ScopeUseCases } from '../../application/scope/scope.use-cases.js';
 import { StockUseCases } from '../../application/stock/stock.use-cases.js';
 import { CartUseCases } from '../../application/carts/cart.use-cases.js';
+import { SaleUseCases } from '../../application/sales/sale.use-cases.js';
 import { PostgresAssignmentRepository } from '../database/postgres-assignment-repository.js';
 import { PostgresScopeReader } from '../database/postgres-scope-reader.js';
 import { PostgresCartRepository } from '../database/postgres-cart-repository.js';
 import { PostgresCartItemRepository } from '../database/postgres-cart-item-repository.js';
+import { PostgresSaleRepository } from '../database/postgres-sale-repository.js';
 import { PostgresStockRepository } from '../database/postgres-stock-repository.js';
 import { PostgresIdempotencyStore } from '../database/postgres-idempotency-store.js';
 import { PostgresAccessReader } from '../database/postgres-access-reader.js';
@@ -39,6 +41,7 @@ import { MeController } from './me.controller.js';
 import { StockController } from './stock.controller.js';
 import { CartsController } from './carts.controller.js';
 import { CartItemsController } from './cart-items.controller.js';
+import { SalesController } from './sales.controller.js';
 import { HealthController } from './health.controller.js';
 import { NestAuditLog } from './nest-audit-log.js';
 import {
@@ -55,6 +58,7 @@ import {
   INVENTORY_LINE_USE_CASES,
   INVENTORY_USE_CASES,
   PRODUCT_USE_CASES,
+  SALE_USE_CASES,
   SCOPE_USE_CASES,
   STOCK_USE_CASES,
 } from './tokens.js';
@@ -82,6 +86,7 @@ export class AppModule implements OnApplicationShutdown {
         StockController,
         CartsController,
         CartItemsController,
+        SalesController,
       ],
       providers: [
         { provide: APP_CONFIG, useValue: config },
@@ -173,6 +178,17 @@ export class AppModule implements OnApplicationShutdown {
             new CartUseCases(
               new PostgresCartRepository(pool),
               new PostgresCartItemRepository(pool),
+              scope,
+              new NestAuditLog(),
+            ),
+          inject: [DB_POOL, SCOPE_USE_CASES],
+        },
+        {
+          provide: SALE_USE_CASES,
+          useFactory: (pool: Pool, scope: ScopeUseCases) =>
+            new SaleUseCases(
+              new PostgresSaleRepository(pool),
+              new PostgresCartRepository(pool),
               scope,
               new NestAuditLog(),
             ),

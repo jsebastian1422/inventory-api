@@ -52,6 +52,7 @@ function presentHistory(h: LineHistoryEntry) {
     currentBefore: h.currentBefore,
     currentAfter: h.currentAfter,
     delta: h.delta,
+    saleId: h.saleId,
     actorId: h.actorId,
     changedAt: h.changedAt,
   };

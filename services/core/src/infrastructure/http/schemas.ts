@@ -261,7 +261,7 @@ export const createCartSchema = z.object({ id: idSchema.optional(), establishmen
 export const cartStatusSchema = z.object({ status: z.literal('cancelled') });
 
 export const listCartsQuerySchema = z.object({
-  status: z.enum(['open', 'cancelled']).optional(),
+  status: z.enum(['open', 'cancelled', 'sold']).optional(),
   establishmentId: idSchema.optional(),
   userId: idSchema.optional(),
   limit: limitQuery,
@@ -276,3 +276,28 @@ export const addCartItemSchema = z.object({
 });
 
 export const updateCartItemSchema = z.object({ quantity });
+
+// ---- Sales (sprint 008) ----
+
+/** Buyer: validated and normalized by the domain (Spanish messages); here only shape and NUL. */
+const customerSchema = z.object({
+  docType: text(),
+  docNumber: text(),
+  name: text(),
+  email: text().nullable().optional(),
+  phone: text().nullable().optional(),
+});
+
+/** `id` is the optional client-generated identifier of the sale; the number is always the server's. */
+export const checkoutSchema = z
+  .object({ id: idSchema.optional(), customer: customerSchema.nullable().optional() })
+  .default({});
+
+export const listSalesQuerySchema = z.object({
+  establishmentId: idSchema.optional(),
+  sellerId: idSchema.optional(),
+  from: date.optional(),
+  to: date.optional(),
+  limit: limitQuery,
+  offset: offsetQuery,
+});

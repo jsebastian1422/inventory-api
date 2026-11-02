@@ -17,8 +17,8 @@ import type { ChangeBatch, ChangeCursor } from '../../domain/sync/change-cursor.
 import { FOREIGN_KEY_VIOLATION, isPgError, UNIQUE_VIOLATION } from './pool.js';
 import { inTransaction, VersionedTable } from './versioned-table.js';
 
-const COLUMNS = `id, establishment_id, created_by, status, cancelled_by, cancelled_at, version,
-  created_at, updated_at`;
+const COLUMNS = `id, establishment_id, created_by, status, cancelled_by, cancelled_at, sold_by, sold_at,
+  (SELECT s.id FROM sales s WHERE s.cart_id = carts.id) AS sale_id, version, created_at, updated_at`;
 
 interface CartRow {
   id: string;
@@ -27,6 +27,9 @@ interface CartRow {
   status: CartStatus;
   cancelled_by: string | null;
   cancelled_at: Date | null;
+  sold_by: string | null;
+  sold_at: Date | null;
+  sale_id: string | null;
   version: number;
   created_at: Date;
   updated_at: Date;
@@ -40,6 +43,9 @@ function toCart(row: CartRow): Cart {
     status: row.status,
     cancelledBy: row.cancelled_by,
     cancelledAt: row.cancelled_at,
+    soldBy: row.sold_by,
+    soldAt: row.sold_at,
+    saleId: row.sale_id,
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -201,6 +207,9 @@ export class PostgresCartRepository implements CartRepository {
       if (!current) return { status: 'not_found' };
       if (expectedVersion !== undefined && current.version !== expectedVersion) {
         return { status: 'conflict', current };
+      }
+      if (current.status === 'sold') {
+        throw conflictError('El carrito no está abierto', 'CART_NOT_OPEN');
       }
       if (current.status === 'cancelled')
         return { status: 'updated', value: current, changed: false };

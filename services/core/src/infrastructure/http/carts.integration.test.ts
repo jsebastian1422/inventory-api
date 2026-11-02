@@ -285,6 +285,8 @@ describe('schema (CA-1) and permissions (CA-2)', () => {
       'created_by',
       'establishment_id',
       'id',
+      'sold_at',
+      'sold_by',
       'status',
       'updated_at',
       'version',
@@ -294,7 +296,7 @@ describe('schema (CA-1) and permissions (CA-2)', () => {
         .filter((r) => r.is_nullable === 'YES')
         .map((r) => r.column_name)
         .sort(),
-    ).toEqual(['cancelled_at', 'cancelled_by']);
+    ).toEqual(['cancelled_at', 'cancelled_by', 'sold_at', 'sold_by']);
     const items = await columns('cart_items');
     expect(items.map((r) => r.column_name)).toEqual([
       'cart_id',
@@ -430,6 +432,9 @@ describe('create cart (CA-3)', () => {
       'createdBy',
       'establishmentId',
       'id',
+      'saleId',
+      'soldAt',
+      'soldBy',
       'status',
       'updatedAt',
       'version',

@@ -81,3 +81,8 @@ export type StockPermission = (typeof STOCK_PERMISSIONS)[number];
 export const CART_PERMISSIONS = ['carts.use', 'carts.read'] as const;
 
 export type CartPermission = (typeof CART_PERMISSIONS)[number];
+
+/** Permissions of the sales module (services/core, sprint 008): sell own carts and read sales by scope. */
+export const SALE_PERMISSIONS = ['sales.create', 'sales.read'] as const;
+
+export type SalePermission = (typeof SALE_PERMISSIONS)[number];

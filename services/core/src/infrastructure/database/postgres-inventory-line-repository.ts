@@ -70,6 +70,7 @@ interface HistoryRow {
   current_before: string | null;
   current_after: string;
   delta: string | null;
+  sale_id: string | null;
   actor_id: string;
   changed_at: Date;
 }
@@ -360,7 +361,7 @@ export class PostgresInventoryLineRepository implements InventoryLineRepository 
     const { rows } = await this.pool.query<HistoryRow>(
       `SELECT id, reason, initial_before::text AS initial_before, initial_after::text AS initial_after,
          current_before::text AS current_before, current_after::text AS current_after,
-         delta::text AS delta, actor_id, changed_at
+         delta::text AS delta, sale_id, actor_id, changed_at
        FROM inventory_line_history WHERE line_id = $1
        ORDER BY changed_at DESC, id DESC LIMIT $2 OFFSET $3`,
       [lineId, limit, offset],
@@ -374,6 +375,7 @@ export class PostgresInventoryLineRepository implements InventoryLineRepository 
         currentBefore: row.current_before,
         currentAfter: row.current_after,
         delta: row.delta,
+        saleId: row.sale_id,
         actorId: row.actor_id,
         changedAt: row.changed_at,
       })),
