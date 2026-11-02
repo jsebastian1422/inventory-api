@@ -60,6 +60,14 @@ export interface CartDetail {
   readonly unavailableCount: number;
 }
 
+/** Inconsistency: a `sold` cart without its sale. Surfaces as an internal error (never partial data). */
+export class SoldCartWithoutSaleError extends Error {
+  constructor(readonly cartId: string) {
+    super(`Sold cart ${cartId} has no sale`);
+    this.name = 'SoldCartWithoutSaleError';
+  }
+}
+
 export const cartNotFoundError = (): DomainError =>
   new DomainError('not_found', 'Carrito no encontrado', 'CART_NOT_FOUND');
 

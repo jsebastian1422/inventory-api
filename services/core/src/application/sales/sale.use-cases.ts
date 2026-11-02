@@ -145,7 +145,7 @@ export class SaleUseCases {
     const own = canSell(actor) ? actor.userId : undefined;
     if (!canReadSales(actor)) return { sellerId: own };
     if (hasFullAccess(actor)) return { sellerId: own, establishmentIds: 'all' };
-    const { ids } = await this.scope.resolve(actor);
+    const ids = await this.scope.resolveForSalesRead(actor);
     return { sellerId: own, establishmentIds: ids };
   }
 
@@ -153,7 +153,7 @@ export class SaleUseCases {
     if (canSell(actor) && isSeller(sale, actor)) return true;
     if (!canReadSales(actor)) return false;
     if (readsAllSales(actor)) return true;
-    const { ids } = await this.scope.resolve(actor);
+    const ids = await this.scope.resolveForSalesRead(actor);
     return ids.includes(sale.establishmentId);
   }
 

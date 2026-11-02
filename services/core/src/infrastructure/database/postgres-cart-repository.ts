@@ -1,6 +1,7 @@
 import type { Pool } from 'pg';
 import {
   cartNotFoundError,
+  SoldCartWithoutSaleError,
   type Cart,
   type CartDetail,
   type CartDetailItem,
@@ -99,6 +100,25 @@ const DETAIL_SQL = `SELECT d.*,
   ) d
   ORDER BY d.item_created_at, d.id`;
 
+interface SoldDetailRow extends DetailRow {
+  sale_total: string;
+}
+
+/**
+ * Detail of a `sold` cart from the frozen data of its sale (sprint 010): product and price as
+ * sold, quantity and subtotal of the sale; only `quantity_current` of the lot is live.
+ */
+const SOLD_DETAIL_SQL = `SELECT ci.id, ci.version, si.quantity::text AS quantity,
+    si.inventory_line_id AS line_id, si.barcode, to_char(si.expires_on, 'YYYY-MM-DD') AS expires_on,
+    l.quantity_current::text AS quantity_current,
+    si.product_id, si.sku, si.product_name, si.unit, si.unit_price::text AS price,
+    si.subtotal::text AS subtotal, NULL::text AS unavailable_reason, s.total::text AS sale_total
+  FROM sale_items si
+  JOIN sales s ON s.id = si.sale_id AND s.cart_id = $1
+  JOIN cart_items ci ON ci.id = si.cart_item_id
+  JOIN inventory_lines l ON l.id = si.inventory_line_id
+  ORDER BY ci.created_at, ci.id`;
+
 function toDetailItem(row: DetailRow): CartDetailItem {
   return {
     id: row.id,
@@ -166,12 +186,28 @@ export class PostgresCartRepository implements CartRepository {
   async findDetail(id: string): Promise<CartDetail | null> {
     const cart = await this.table.findById(this.pool, id);
     if (!cart) return null;
+    if (cart.status === 'sold') return this.soldDetail(cart);
     const { rows } = await this.pool.query<DetailRow>(DETAIL_SQL, [id]);
     return {
       cart,
       items: rows.map(toDetailItem),
       total: rows[0]?.total ?? EMPTY_TOTAL,
       unavailableCount: rows.filter((row) => row.unavailable_reason !== null).length,
+    };
+  }
+
+  private async soldDetail(cart: Cart): Promise<CartDetail> {
+    const sale = await this.pool.query<{ total: string }>(
+      'SELECT total::text AS total FROM sales WHERE cart_id = $1',
+      [cart.id],
+    );
+    if (!sale.rows[0]) throw new SoldCartWithoutSaleError(cart.id);
+    const { rows } = await this.pool.query<SoldDetailRow>(SOLD_DETAIL_SQL, [cart.id]);
+    return {
+      cart,
+      items: rows.map(toDetailItem),
+      total: sale.rows[0].total,
+      unavailableCount: 0,
     };
   }
 

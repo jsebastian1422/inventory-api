@@ -19,6 +19,14 @@ export class ScopeUseCases {
     return this.scopes.resolve(actor.userId, hasFullAccess(actor));
   }
 
+  /**
+   * Establishments whose sales the actor may read: current assignments, active or not (sprint 010).
+   * Does not widen the scope to operate; `resolve` keeps excluding inactive establishments.
+   */
+  resolveForSalesRead(actor: Actor): Promise<string[]> {
+    return this.scopes.resolveAssignedForRead(actor.userId);
+  }
+
   /** 404 / 409 / 403 per R-5; returns the establishment when the actor may operate in it. */
   async assertInScope(actor: Actor, establishmentId: string): Promise<Establishment> {
     const establishment = await this.establishments.findById(establishmentId);

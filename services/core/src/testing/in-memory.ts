@@ -116,11 +116,18 @@ export class InMemoryEstablishmentRepository implements EstablishmentRepository 
 }
 
 export class RecordingAuditLog implements AuditLog {
-  readonly events: { level: 'info' | 'warn'; event: string; data: Record<string, unknown> }[] = [];
+  readonly events: {
+    level: 'info' | 'warn' | 'error';
+    event: string;
+    data: Record<string, unknown>;
+  }[] = [];
   info(event: string, data: Record<string, unknown>): void {
     this.events.push({ level: 'info', event, data });
   }
   warn(event: string, data: Record<string, unknown>): void {
     this.events.push({ level: 'warn', event, data });
+  }
+  error(event: string, data: Record<string, unknown>): void {
+    this.events.push({ level: 'error', event, data });
   }
 }

@@ -57,6 +57,7 @@ function setup() {
   const log: AuditLog = {
     info: (event, data) => events.push({ event, data }),
     warn: (event, data) => events.push({ event, data }),
+    error: (event, data) => events.push({ event, data }),
   };
   const assignments = new FakeAssignments();
   const establishments = new InMemoryEstablishmentRepository();

@@ -6,6 +6,8 @@ const ALL_ACTIVE = 'SELECT id FROM establishments WHERE is_active';
 const ASSIGNED_ACTIVE = `SELECT e.id FROM establishments e
   JOIN establishment_users eu ON eu.establishment_id = e.id
   WHERE eu.user_id = $1 AND eu.removed_at IS NULL AND e.is_active`;
+const ASSIGNED_ANY = `SELECT establishment_id AS id FROM establishment_users
+  WHERE user_id = $1 AND removed_at IS NULL`;
 
 /** Live scope (ADR-0004): one query per request, no cache. Read-only. */
 export class PostgresScopeReader implements ScopeReader {
@@ -16,5 +18,10 @@ export class PostgresScopeReader implements ScopeReader {
       ? await this.pool.query<{ id: string }>(ALL_ACTIVE)
       : await this.pool.query<{ id: string }>(ASSIGNED_ACTIVE, [userId]);
     return { access: all ? 'all' : 'assigned', ids: rows.map((row) => row.id) };
+  }
+
+  async resolveAssignedForRead(userId: string): Promise<string[]> {
+    const { rows } = await this.pool.query<{ id: string }>(ASSIGNED_ANY, [userId]);
+    return rows.map((row) => row.id);
   }
 }

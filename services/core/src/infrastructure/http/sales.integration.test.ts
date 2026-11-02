@@ -203,10 +203,7 @@ function events(name: string): Record<string, unknown>[] {
 }
 
 async function clean() {
-  await pool.query('DELETE FROM inventory_line_history');
-  await pool.query('DELETE FROM sale_items');
-  await pool.query('DELETE FROM sales');
-  await pool.query('DELETE FROM sale_counters');
+  await pool.query('TRUNCATE inventory_line_history, sale_items, sales, sale_counters');
   await pool.query('DELETE FROM cart_items');
   await pool.query('DELETE FROM carts');
   if (establishmentIds.length > 0) {
@@ -515,10 +512,8 @@ describe('schema (CA-1) and permissions (CA-2)', () => {
     await expect(insertHistory('other', null)).rejects.toMatchObject(check);
     await expect(insertHistory('sale', sale)).resolves.toBeDefined();
     await expect(pool.query('DELETE FROM sales WHERE id = $1', [sale])).rejects.toMatchObject({
-      code: '23503',
+      code: 'P0V01',
     });
-    await pool.query('DELETE FROM inventory_line_history WHERE line_id = $1', [lot.lineId]);
-    await pool.query('DELETE FROM sales WHERE id = $1', [sale]);
     await pool.query(
       `UPDATE carts SET status = 'open', sold_at = NULL, sold_by = NULL WHERE id = $1`,
       [cart.id],
@@ -1626,5 +1621,201 @@ describe('audit (CA-15) and compatibility (CA-16)', () => {
       return undefined;
     })();
     expect(feed).toMatchObject({ status: 'sold', saleId: res.body.id });
+  });
+});
+
+describe('immutability (sprint 010, ADR-0006)', () => {
+  const IMMUTABLE = { code: 'P0V01' };
+
+  it('UPDATE and DELETE on sales and sale_items fail with P0V01 and change nothing', async () => {
+    const { who, est } = await mkSeller();
+    const lot = await mkLot(est, '10.00', '10');
+    const { cart } = await cartWith(who, est, [[lot.lineId, '2']]);
+    const sale = await sell(who, cart.id);
+    expect(sale.status, sale.raw).toBe(201);
+    const id = sale.body.id as string;
+    const snapshot = async () => ({
+      sale: (await pool.query('SELECT * FROM sales WHERE id = $1', [id])).rows,
+      items: (await pool.query('SELECT * FROM sale_items WHERE sale_id = $1', [id])).rows,
+    });
+    const before = await snapshot();
+    await expect(
+      pool.query(`UPDATE sales SET total = 1 WHERE id = $1`, [id]),
+    ).rejects.toMatchObject(IMMUTABLE);
+    await expect(
+      pool.query(`UPDATE sale_items SET quantity = 1 WHERE sale_id = $1`, [id]),
+    ).rejects.toMatchObject(IMMUTABLE);
+    await expect(
+      pool.query('DELETE FROM sale_items WHERE sale_id = $1', [id]),
+    ).rejects.toMatchObject(IMMUTABLE);
+    await expect(pool.query('DELETE FROM sales WHERE id = $1', [id])).rejects.toMatchObject(
+      IMMUTABLE,
+    );
+    expect(await snapshot()).toEqual(before);
+    const names = await pool.query<{ tgname: string }>(
+      `SELECT tgname FROM pg_trigger WHERE tgname IN ('sales_immutable_trg', 'sale_items_immutable_trg')`,
+    );
+    expect(names.rows).toHaveLength(2);
+  });
+});
+
+describe('sales of deactivated assigned establishments (sprint 010, RE-3, RE-4)', () => {
+  /** A seller sells in `est`, then a reader with `sales.read` is assigned to it. */
+  async function setupSold() {
+    const seller = await mkSeller();
+    const lot = await mkLot(seller.est, '5.00', '10');
+    const { cart } = await cartWith(seller.who, seller.est, [[lot.lineId, '1']]);
+    const sale = await sell(seller.who, cart.id);
+    expect(sale.status, sale.raw).toBe(201);
+    const reader = await actor(['sales.read']);
+    await assignTo(reader, seller.est);
+    return { seller, lot, cart, sale: sale.body as { id: string }, reader };
+  }
+  const ids = (res: Res) => (res.body.items as { id: string }[]).map((i) => i.id);
+  const deactivate = (est: string) =>
+    pool.query('UPDATE establishments SET is_active = false WHERE id = $1', [est]);
+
+  it('CA-5: a reader assigned to a deactivated establishment still sees its sales', async () => {
+    const w = await setupSold();
+    await deactivate(w.seller.est);
+    expect(ids(await as(w.reader, 'GET', '/sales'))).toEqual([w.sale.id]);
+    expect(ids(await as(w.reader, 'GET', `/sales?establishmentId=${w.seller.est}`))).toEqual([
+      w.sale.id,
+    ]);
+    expect((await as(w.reader, 'GET', `/sales/${w.sale.id}`)).status).toBe(200);
+  });
+
+  it('CA-6: with the assignment removed the sales are not listed and the sale is 404', async () => {
+    const w = await setupSold();
+    await deactivate(w.seller.est);
+    await pool.query(
+      'UPDATE establishment_users SET removed_at = now(), removed_by = user_id WHERE user_id = $1',
+      [w.reader.userId],
+    );
+    expect(ids(await as(w.reader, 'GET', '/sales'))).toEqual([]);
+    expect(await as(w.reader, 'GET', `/sales/${w.sale.id}`)).toMatchObject({
+      status: 404,
+      body: { code: 'SALE_NOT_FOUND' },
+    });
+    // never assigned: also hidden
+    const stranger = await actor(['sales.read']);
+    expect((await as(stranger, 'GET', `/sales/${w.sale.id}`)).status).toBe(404);
+  });
+
+  it('CA-7: operating in a deactivated establishment keeps failing as before', async () => {
+    const w = await setupSold();
+    const other = await mkLot(w.seller.est, '2.00', '5');
+    const open = await cartWith(w.seller.who, w.seller.est, [[other.lineId, '1']]);
+    await deactivate(w.seller.est);
+    expect(await sell(w.seller.who, open.cart.id)).toMatchObject({
+      status: 409,
+      body: { code: 'ESTABLISHMENT_INACTIVE' },
+    });
+    expect(
+      await as(w.seller.who, 'POST', '/carts', { establishmentId: w.seller.est }),
+    ).toMatchObject({ status: 409, body: { code: 'ESTABLISHMENT_INACTIVE' } });
+    const mine = await as(w.reader, 'GET', '/me/establishments');
+    expect(mine.status, mine.raw).toBe(200);
+    expect(ids(mine)).not.toContain(w.seller.est);
+    // the seller still sees own sales; establishments.all sees everything as before
+    expect(ids(await as(w.seller.who, 'GET', '/sales'))).toEqual([w.sale.id]);
+    const all = await actor(['sales.read', 'establishments.all']);
+    expect((await as(all, 'GET', `/sales/${w.sale.id}`)).status).toBe(200);
+  });
+});
+
+describe('detail of a sold cart (sprint 010, RE-5, RE-6)', () => {
+  it('CA-8: shows the frozen sale data after the product and the lot changed', async () => {
+    const { who, est } = await mkSeller();
+    const a = await mkLot(est, '12.34', '10');
+    const b = await mkLot(est, '3.00', '5');
+    const { cart } = await cartWith(who, est, [
+      [a.lineId, '3'],
+      [b.lineId, '1.500'],
+    ]);
+    const before = await as(who, 'GET', `/carts/${cart.id}`);
+    const sale = await sell(who, cart.id);
+    expect(sale.status, sale.raw).toBe(201);
+    expect((await build('PATCH', `/products/${a.productId}`, { price: '99.00' })).status).toBe(200);
+    await pool.query('UPDATE inventory_lines SET quantity_current = 0 WHERE id = $1', [b.lineId]);
+    await pool.query('UPDATE inventory_lines SET is_active = false WHERE id = $1', [a.lineId]);
+    const detail = await as(who, 'GET', `/carts/${cart.id}`);
+    expect(detail.status, detail.raw).toBe(200);
+    expect(Object.keys(detail.body).sort()).toEqual(Object.keys(before.body).sort());
+    expect(detail.body).toMatchObject({
+      status: 'sold',
+      total: sale.body.total,
+      unavailableCount: 0,
+    });
+    expect(detail.body.items).toHaveLength(2);
+    const frozen = sale.body.items as {
+      productId: string;
+      unitPrice: string;
+      quantity: string;
+      subtotal: string;
+    }[];
+    for (const item of detail.body.items) {
+      const sold = frozen.find((s) => s.productId === item.product.id)!;
+      expect(item).toMatchObject({
+        available: true,
+        unavailableReason: null,
+        quantity: sold.quantity,
+        subtotal: sold.subtotal,
+        product: { price: sold.unitPrice },
+      });
+    }
+    const first = detail.body.items.find(
+      (i: { product: { id: string } }) => i.product.id === a.productId,
+    );
+    expect(first.product.price).toBe('12.34');
+    expect(first.subtotal).toBe('37.02');
+    expect(Object.keys(first).sort()).toEqual(Object.keys(before.body.items[0]).sort());
+  });
+
+  it('CA-9: a sold cart without sale is an internal error logged as cart.sold_without_sale', async () => {
+    const { who, est } = await mkSeller();
+    const lot = await mkLot(est, '1.00', '10');
+    const { cart } = await cartWith(who, est, [[lot.lineId, '1']]);
+    await pool.query(
+      `UPDATE carts SET status = 'sold', sold_at = now(), sold_by = $2 WHERE id = $1`,
+      [cart.id, who.userId],
+    );
+    logs.length = 0;
+    const res = await as(who, 'GET', `/carts/${cart.id}`);
+    expect(res.status).toBe(500);
+    expect(res.body).not.toHaveProperty('items');
+    expect(events('cart.sold_without_sale')).toEqual([
+      expect.objectContaining({ cartId: cart.id }),
+    ]);
+    await pool.query(
+      `UPDATE carts SET status = 'open', sold_at = NULL, sold_by = NULL WHERE id = $1`,
+      [cart.id],
+    );
+  });
+
+  it('CA-10: open and cancelled carts keep the live availability', async () => {
+    const { who, est } = await mkSeller();
+    const lot = await mkLot(est, '4.00', '10');
+    const { cart } = await cartWith(who, est, [[lot.lineId, '2']]);
+    expect(await as(who, 'GET', `/carts/${cart.id}`)).toMatchObject({
+      status: 200,
+      body: { total: '8.00', unavailableCount: 0 },
+    });
+    expect((await build('PATCH', `/products/${lot.productId}`, { price: '5.00' })).status).toBe(
+      200,
+    );
+    await pool.query('UPDATE inventory_lines SET is_active = false WHERE id = $1', [lot.lineId]);
+    const open = await as(who, 'GET', `/carts/${cart.id}`);
+    expect(open.body).toMatchObject({ total: '0.00', unavailableCount: 1 });
+    expect(open.body.items[0]).toMatchObject({
+      available: false,
+      unavailableReason: 'LINE_INACTIVE',
+      product: { price: '5.00' },
+    });
+    const cancelled = await as(who, 'PATCH', `/carts/${cart.id}/status`, { status: 'cancelled' });
+    expect(cancelled.status, cancelled.raw).toBe(200);
+    const after = await as(who, 'GET', `/carts/${cart.id}`);
+    expect(after.body).toMatchObject({ status: 'cancelled', unavailableCount: 1 });
+    expect(after.body.items[0].unavailableReason).toBe('LINE_INACTIVE');
   });
 });

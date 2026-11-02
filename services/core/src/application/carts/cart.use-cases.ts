@@ -3,6 +3,7 @@ import {
   cartNotFoundError,
   canReadOthersCarts,
   PERM_CART_USE,
+  SoldCartWithoutSaleError,
   type Cart,
   type CartDetail,
   type CartStatus,
@@ -80,7 +81,15 @@ export class CartUseCases {
   /** Own cart (`carts.use`) or foreign one for a reader; otherwise 404 CART_NOT_FOUND. */
   async get(actor: Actor, id: string): Promise<CartDetail> {
     cartAccess(await this.carts.findById(id), actor, cartNotFoundError, true);
-    const detail = await this.carts.findDetail(id);
+    let detail: CartDetail | null;
+    try {
+      detail = await this.carts.findDetail(id);
+    } catch (error) {
+      if (error instanceof SoldCartWithoutSaleError) {
+        this.log.error('cart.sold_without_sale', { cartId: error.cartId, actorId: actor.userId });
+      }
+      throw error;
+    }
     if (!detail) throw cartNotFoundError();
     return detail;
   }

@@ -439,11 +439,32 @@ reason, available, requested } ]` para **cada** item afectado. `reason`: `LINE_I
 - Concurrencia: bloquea carrito, local (FOR SHARE), productos e inventarios (FOR SHARE) y lineas (FOR UPDATE, por id) y
   al final el contador; dos checkouts del mismo carrito dan una venta y un 409 `CART_NOT_OPEN`; dos carritos sobre un
   lote con existencia para uno dan una venta y un 409 `SALE_ITEMS_UNAVAILABLE`.
-- Lectura (R-1): el vendedor (`sales.create`) ve sus ventas; con `sales.read` se ven las de los locales del alcance
-  (con `establishments.all`, todas). Una venta que no puedes ver es 404. `GET /sales` sin ninguno de los dos permisos:
+- Lectura (R-1): el vendedor (`sales.create`) ve sus ventas; con `sales.read` se ven las de los locales con
+  asignacion vigente **aunque el local este desactivado** (desactivar un local solo impide vender; con
+  `establishments.all`, todas). Una asignacion retirada oculta las ventas de ese local. Una venta que no puedes ver es 404. `GET /sales` sin ninguno de los dos permisos:
   403; `sellerId` ajeno exige `sales.read`.
 - Carrito vendido: `status: "sold"`, `soldAt`, `soldBy` y `saleId` (los carritos agregan estos tres campos, nulos si no
   estan vendidos; `GET /carts?status=sold` lo filtra). Toda escritura de carrito o items: 409 `CART_NOT_OPEN`.
+- `GET /carts/:id` de un carrito `sold` devuelve los datos **congelados de la venta** (misma forma de respuesta):
+  `product.price`, `quantity`, `subtotal` y `total` son los de la venta y no cambian si el producto cambia;
+  `available: true`, `unavailableReason: null` y `unavailableCount: 0`; solo `line.quantityCurrent` es la existencia
+  actual del lote. En carritos `open` y `cancelled` el precio y la disponibilidad siguen siendo los vigentes. Un carrito
+  `sold` sin venta es una inconsistencia: 500 y log `cart.sold_without_sale`.
+
+### Inmutabilidad de las ventas (ADR-0006)
+
+Los triggers `sales_immutable_trg` (en `sales`) y `sale_items_immutable_trg` (en `sale_items`) ejecutan
+`sales_immutable()` antes de todo `UPDATE` o `DELETE` de fila y lanzan una excepcion con SQLSTATE **`P0V01`**
+("Las ventas son inmutables (tabla %, operacion %)"); la transaccion se aborta. No hay bypass por sesion y el checkout
+(solo `INSERT`) no se ve afectado. El vaciado completo de tabla no se bloquea: es la unica via de limpieza y se usa
+**solo en la BD de pruebas** (`inventory_test`); un rol con DDL puede desactivar el trigger (la proteccion es contra
+errores, no contra un administrador). Los borrados selectivos de ventas (p. ej. `.process/sprints/008/pruebas/cleanup.sh`)
+dejan de funcionar en una BD con ventas.
+
+Rollback: el `down` de `sales-cart-history` aborta con "No se puede revertir sales-cart-history: existen ventas..." si
+hay carritos `sold` o historico `sale`, sin modificar nada. Para revertir esa migracion hay que vaciar antes las
+ventas (solo en pruebas); el `down` de `sales-immutability` elimina triggers y funcion sin tocar datos.
+
 - Historico de la linea (`GET /inventory-lines/:id/history`): motivo `sale` con `saleId` (la respuesta agrega `saleId`,
   `null` en `created` e `initial_adjusted`).
 - Auditoria: `sale.created` (`saleId`, `number`, `establishmentId`, `sellerId`, `cartId`, `total`, `actorId`) e

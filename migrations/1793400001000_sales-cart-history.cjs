@@ -1,4 +1,4 @@
-/* Sales (sprint 008): carts gain the `sold` state (sold_at/sold_by) and inventory_line_history gains the `sale` reason with its sale_id. The CHECKs are replaced (drop + add). down() fails if sold carts or `sale` history rows exist: reverse it only on data without sales. */
+/* Sales (sprint 008): carts gain the `sold` state (sold_at/sold_by) and inventory_line_history gains the `sale` reason with its sale_id. The CHECKs are replaced (drop + add). down() aborts with a clear message (before any ALTER) if sold carts or `sale` history rows exist: reverse it only on data without sales. */
 exports.shorthands = undefined;
 
 /* The name `carts_cancelled_check` is kept; its definition now covers the three states. */
@@ -33,6 +33,13 @@ exports.up = (pgm) => {
 };
 
 exports.down = (pgm) => {
+  pgm.sql(`DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM carts WHERE status = 'sold')
+     OR EXISTS (SELECT 1 FROM inventory_line_history WHERE reason = 'sale') THEN
+    RAISE EXCEPTION 'No se puede revertir sales-cart-history: existen ventas (carritos sold o historial sale). Elimine las ventas antes de revertir.';
+  END IF;
+END $$;`);
+
   pgm.dropConstraint('inventory_line_history', 'inventory_line_history_sale_check');
   pgm.dropConstraint('inventory_line_history', 'inventory_line_history_reason_check');
   pgm.addConstraint('inventory_line_history', 'inventory_line_history_reason_check', {

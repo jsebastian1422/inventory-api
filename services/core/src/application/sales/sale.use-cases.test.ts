@@ -66,7 +66,12 @@ const sale: Sale = {
 const actor = (userId: string, ...permissions: string[]) => ({ userId, permissions });
 
 function setup(
-  options: { cart?: Cart | null; outcome?: CheckoutOutcome; scopeIds?: string[] } = {},
+  options: {
+    cart?: Cart | null;
+    outcome?: CheckoutOutcome;
+    scopeIds?: string[];
+    readIds?: string[];
+  } = {},
 ) {
   const calls: { checkout: CheckoutInput[]; list: SaleFilter[] } = { checkout: [], list: [] };
   const sales: SaleRepository = {
@@ -98,6 +103,9 @@ function setup(
     },
     async resolve() {
       return { access: 'assigned', ids: inScope };
+    },
+    async resolveForSalesRead() {
+      return options.readIds ?? inScope;
     },
   } as unknown as ScopeUseCases;
   const log = new RecordingAuditLog();
@@ -205,6 +213,24 @@ describe('queries (R-1)', () => {
     expect(await code(() => uc.get(actor(SELLER, 'sales.create'), 'zzz'))).toBe(
       'not_found:SALE_NOT_FOUND',
     );
+  });
+
+  it('read scope includes assigned establishments even when the operate scope excludes them (RE-3)', async () => {
+    const page = { limit: 10, offset: 0 };
+    const inactive = setup({ scopeIds: [], readIds: [EST] });
+    await inactive.uc.list(actor(OTHER, 'sales.read'), page);
+    expect(inactive.calls.list[0]!.visibility).toEqual({
+      sellerId: undefined,
+      establishmentIds: [EST],
+    });
+    await expect(
+      setup({ scopeIds: [], readIds: [EST] }).uc.get(actor(OTHER, 'sales.read'), sale.id),
+    ).resolves.toBeDefined();
+    expect(
+      await code(() =>
+        setup({ scopeIds: [EST], readIds: [] }).uc.get(actor(OTHER, 'sales.read'), sale.id),
+      ),
+    ).toBe('not_found:SALE_NOT_FOUND');
   });
 
   it('list: visibility by permission and scope; 403 with neither or a foreign sellerId', async () => {

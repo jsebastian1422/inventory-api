@@ -15,6 +15,10 @@ export class NestAuditLog implements AuditLog {
     this.logger.warn(this.format(event, data));
   }
 
+  error(event: string, data: Record<string, unknown>): void {
+    this.logger.error(this.format(event, data));
+  }
+
   private format(event: string, data: Record<string, unknown>): string {
     const safe = Object.fromEntries(
       Object.entries(data).filter(([key]) => !SENSITIVE_KEY.test(key)),
