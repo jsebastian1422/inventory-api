@@ -1,6 +1,7 @@
 import { Inject, Module, type DynamicModule, type OnApplicationShutdown } from '@nestjs/common';
 import { APP_GUARD, APP_FILTER } from '@nestjs/core';
 import type { Pool } from 'pg';
+import type { Mailer } from '../../domain/auth/ports.js';
 import type { IdentityConfig } from '../config/config.js';
 import { createPool } from '../database/pool.js';
 import { AuthController } from './auth.controller.js';
@@ -18,7 +19,7 @@ export class AppModule implements OnApplicationShutdown {
   constructor(@Inject(DB_POOL) private readonly pool: Pool) {}
 
   /** The configuration is validated once by the caller and reused here (no second loadConfig). */
-  static register(config: IdentityConfig): DynamicModule {
+  static register(config: IdentityConfig, overrides: { mailer?: Mailer } = {}): DynamicModule {
     return {
       module: AppModule,
       controllers: [HealthController, AuthController, UsersController, RolesController],
@@ -27,7 +28,7 @@ export class AppModule implements OnApplicationShutdown {
         { provide: DB_POOL, useFactory: (): Pool => createPool(config.database) },
         {
           provide: USE_CASES,
-          useFactory: (pool: Pool) => createUseCases(config, pool, new NestAuditLog()),
+          useFactory: (pool: Pool) => createUseCases(config, pool, new NestAuditLog(), overrides),
           inject: [DB_POOL],
         },
         { provide: APP_GUARD, useClass: AuthGuard },

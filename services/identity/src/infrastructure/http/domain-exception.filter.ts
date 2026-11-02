@@ -14,6 +14,7 @@ const STATUS: Record<ErrorKind, number> = {
   forbidden: 403,
   not_found: 404,
   conflict: 409,
+  rate_limited: 429,
 };
 
 const REASON: Record<number, string> = {
@@ -23,6 +24,7 @@ const REASON: Record<number, string> = {
   404: 'Not Found',
   405: 'Method Not Allowed',
   409: 'Conflict',
+  429: 'Too Many Requests',
   413: 'Payload Too Large',
   415: 'Unsupported Media Type',
   500: 'Internal Server Error',
@@ -48,6 +50,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
 
     if (exception instanceof DomainError) {
       statusCode = STATUS[exception.kind];
+      if (exception.retryAfterSeconds !== undefined) {
+        void reply.header('Retry-After', String(exception.retryAfterSeconds));
+      }
       body = {
         code: exception.code,
         message: exception.message,

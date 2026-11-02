@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { execFileSync } from 'node:child_process';
-import { generateKeyPairSync, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
@@ -15,6 +15,8 @@ import { Argon2PasswordHasher } from '../security/argon2-password-hasher.js';
 import { AppModule } from './app.module.js';
 import { configureCors } from './cors.js';
 import { createRepositories } from './composition.js';
+import { registerSessionCookies } from './session-cookie.js';
+import { FakeMailer } from '../../testing/in-memory.js';
 
 /**
  * Integration tests over HTTP against a real PostgreSQL. They use a SEPARATE database
@@ -31,9 +33,14 @@ let pool: Pool;
 let config: IdentityConfig;
 let privatePem: string;
 const logs: string[] = [];
+const mailer = new FakeMailer();
+const WEB_ORIGIN = 'http://localhost:5173';
 
 interface Res {
   status: number;
+  /** Raw `Set-Cookie` header lines. */
+  setCookie: string[];
+  headers: Record<string, unknown>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   body: any;
   raw: string;
@@ -42,16 +49,28 @@ interface Res {
 async function call(
   method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
   url: string,
-  options: { token?: string; body?: unknown } = {},
+  options: {
+    token?: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+    target?: NestFastifyApplication;
+    ip?: string;
+  } = {},
 ): Promise<Res> {
-  const response = await app.inject({
+  const response = await (options.target ?? app).inject({
     method,
     url,
-    headers: options.token ? { authorization: `Bearer ${options.token}` } : {},
+    ...(options.ip ? { remoteAddress: options.ip } : {}),
+    headers: {
+      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+      ...options.headers,
+    },
     ...(options.body !== undefined ? { payload: options.body as object } : {}),
   });
   return {
     status: response.statusCode,
+    headers: response.headers,
+    setCookie: [response.headers['set-cookie'] ?? []].flat().map(String),
     raw: response.body,
     body: response.body ? safeJson(response.body) : undefined,
   };
@@ -67,6 +86,23 @@ function safeJson(text: string): unknown {
 
 async function login(email: string, pwd: string): Promise<Res> {
   return call('POST', '/auth/login', { body: { email, password: pwd } });
+}
+
+/** Value of the `inv_rt` cookie set by a response ('' when it was cleared, undefined if absent). */
+function refreshCookie(res: Res): string | undefined {
+  const line = res.setCookie.find((c) => c.startsWith('inv_rt='));
+  return line?.split(';')[0]!.slice('inv_rt='.length);
+}
+
+/** POST to a cookie endpoint like the web app: allowed Origin, X-Requested-With and the cookie. */
+function withSession(
+  url: '/auth/refresh' | '/auth/logout',
+  cookie: string | undefined,
+  headers: Record<string, string> = { origin: WEB_ORIGIN, 'x-requested-with': 'inventory-web' },
+): Promise<Res> {
+  return call('POST', url, {
+    headers: { ...headers, ...(cookie !== undefined ? { cookie: `inv_rt=${cookie}` } : {}) },
+  });
 }
 
 let adminToken = '';
@@ -102,7 +138,7 @@ async function tokenFor(roleId: string) {
   return {
     ...user,
     token: res.body.accessToken as string,
-    refresh: res.body.refreshToken as string,
+    refresh: refreshCookie(res)!,
   };
 }
 
@@ -114,7 +150,16 @@ beforeAll(async () => {
   config = loadConfig({
     ...env,
     // Pinned: tests must not depend on the developer's .env (CORS tests set it explicitly).
-    CORS_ORIGINS: '',
+    CORS_ORIGINS: WEB_ORIGIN,
+    SESSION_COOKIE_SECURE: 'true',
+    // The shared limiter must not trip over the many logins of this suite (see 'throttling').
+    LOGIN_MAX_ATTEMPTS_EMAIL: '1000',
+    LOGIN_MAX_ATTEMPTS_IP: '1000',
+    LOGIN_ATTEMPT_WINDOW: '15m',
+    PASSWORD_RESET_TTL: '30m',
+    WEB_APP_URL: 'http://web.example.test',
+    SMTP_HOST: '',
+    SMTP_FROM: '',
     JWT_PRIVATE_KEY: privatePem,
     JWT_PUBLIC_KEY: publicKey.export({ type: 'spki', format: 'pem' }) as string,
   });
@@ -147,10 +192,11 @@ beforeAll(async () => {
 
   const capture = (...args: unknown[]) => logs.push(args.map(String).join(' '));
   app = await NestFactory.create<NestFastifyApplication>(
-    AppModule.register(config),
+    AppModule.register(config, { mailer }),
     new FastifyAdapter(),
     { logger: { log: capture, warn: capture, error: capture, debug: capture, verbose: capture } },
   );
+  await registerSessionCookies(app);
   await app.init();
   await app.getHttpAdapter().getInstance().ready();
 
@@ -164,7 +210,7 @@ afterAll(async () => {
 });
 
 describe('auth', () => {
-  it('CA-1: login returns an ES256 JWT (~15 min) and a refresh token', async () => {
+  it('CA-1: login returns an ES256 JWT (~15 min) and the refresh token only in an HttpOnly cookie', async () => {
     const res = await login(adminEmail, ADMIN_PASSWORD);
     expect(res.status).toBe(200);
     const [header, payload] = res.body.accessToken
@@ -173,7 +219,16 @@ describe('auth', () => {
       .map((part: string) => JSON.parse(Buffer.from(part, 'base64url').toString()));
     expect(header.alg).toBe('ES256');
     expect(payload.exp - payload.iat).toBe(900);
-    expect(typeof res.body.refreshToken).toBe('string');
+    expect(res.body.tokenType).toBe('Bearer');
+    expect(res.body.expiresIn).toBe(900);
+    expect(res.body).not.toHaveProperty('refreshToken');
+    const cookie = res.setCookie.find((c) => c.startsWith('inv_rt='))!;
+    expect(cookie).toMatch(/HttpOnly/i);
+    expect(cookie).toMatch(/SameSite=Strict/i);
+    expect(cookie).toMatch(/Path=\/auth(;|$)/);
+    expect(cookie).toMatch(/Secure/i);
+    expect(cookie).toMatch(/Max-Age=604800/i);
+    expect(res.raw).not.toContain(refreshCookie(res)!);
     // The password is never echoed back.
     expect(res.raw).not.toContain(ADMIN_PASSWORD);
   });
@@ -184,32 +239,65 @@ describe('auth', () => {
     expect(a.status).toBe(401);
     expect(b.status).toBe(401);
     expect(a.raw).toBe(b.raw);
+    expect(a.setCookie).toEqual([]);
+    expect(b.setCookie).toEqual([]);
   });
 
-  it('CA-3 / CA-4: refresh rotates, reuse fails, logout revokes', async () => {
+  it('CA-3 / CA-5: refresh rotates the cookie, reuse closes every session, logout revokes', async () => {
     const roleId = await createRole();
     const user = await tokenFor(roleId);
-    const first = await call('POST', '/auth/refresh', { body: { refreshToken: user.refresh } });
+    const first = await withSession('/auth/refresh', user.refresh);
     expect(first.status).toBe(200);
-    expect(first.body.refreshToken).not.toBe(user.refresh);
-    expect(
-      (await call('POST', '/auth/refresh', { body: { refreshToken: user.refresh } })).status,
-    ).toBe(401);
+    expect(first.body.accessToken).toEqual(expect.any(String));
+    expect(first.body).not.toHaveProperty('refreshToken');
+    const rotated = refreshCookie(first)!;
+    expect(rotated).not.toBe(user.refresh);
+    expect((await withSession('/auth/refresh', user.refresh)).status).toBe(401);
     // Reuse closed every session of the user, including the freshly issued one.
-    expect(
-      (await call('POST', '/auth/refresh', { body: { refreshToken: first.body.refreshToken } }))
-        .status,
-    ).toBe(401);
+    expect((await withSession('/auth/refresh', rotated)).status).toBe(401);
 
     const again = await login(user.email, USER_PASSWORD);
-    const out = await call('POST', '/auth/logout', {
-      body: { refreshToken: again.body.refreshToken },
-    });
+    const cookie = refreshCookie(again)!;
+    const out = await withSession('/auth/logout', cookie);
     expect(out.status).toBe(204);
-    expect(
-      (await call('POST', '/auth/refresh', { body: { refreshToken: again.body.refreshToken } }))
-        .status,
-    ).toBe(401);
+    expect(refreshCookie(out)).toBe('');
+    expect(out.setCookie[0]).toMatch(/Path=\/auth/);
+    expect((await withSession('/auth/refresh', cookie)).status).toBe(401);
+  });
+
+  it('CA-3: refresh without a cookie or with a bogus one is 401 INVALID_SESSION and clears the cookie', async () => {
+    for (const cookie of [undefined, 'not-a-real-token']) {
+      const res = await withSession('/auth/refresh', cookie);
+      expect(res.status).toBe(401);
+      expect(res.body.code).toBe('INVALID_SESSION');
+      expect(refreshCookie(res)).toBe('');
+    }
+  });
+
+  it('CA-4: refresh and logout without X-Requested-With or from another Origin are 403 and change nothing', async () => {
+    const user = await tokenFor(await createRole());
+    const bad: Array<Record<string, string>> = [
+      { origin: WEB_ORIGIN },
+      { 'x-requested-with': 'inventory-web' },
+      { origin: 'http://evil.example', 'x-requested-with': 'inventory-web' },
+      { origin: WEB_ORIGIN, 'x-requested-with': 'XMLHttpRequest' },
+      {},
+    ];
+    for (const headers of bad) {
+      for (const url of ['/auth/refresh', '/auth/logout'] as const) {
+        const res = await withSession(url, user.refresh, headers);
+        expect(res.status).toBe(403);
+        expect(res.body.code).toBe('CSRF_REJECTED');
+        expect(res.setCookie).toEqual([]);
+      }
+    }
+    // Nothing was rotated or revoked: the original cookie still refreshes.
+    expect((await withSession('/auth/refresh', user.refresh)).status).toBe(200);
+  });
+
+  it('CA-5: logout without a cookie is 204 with no effect', async () => {
+    const out = await withSession('/auth/logout', undefined);
+    expect(out.status).toBe(204);
   });
 
   it('CA-5: a deactivated user cannot login, refresh or use a still-valid access token', async () => {
@@ -221,9 +309,7 @@ describe('auth', () => {
     });
     expect(off.status).toBe(200);
     expect((await login(user.email, USER_PASSWORD)).status).toBe(401);
-    expect(
-      (await call('POST', '/auth/refresh', { body: { refreshToken: user.refresh } })).status,
-    ).toBe(401);
+    expect((await withSession('/auth/refresh', user.refresh)).status).toBe(401);
     expect((await call('GET', '/users', { token: user.token })).status).toBe(401);
   });
 
@@ -253,9 +339,7 @@ describe('auth', () => {
       body: { currentPassword: USER_PASSWORD, newPassword: next },
     });
     expect(ok.status).toBe(204);
-    expect(
-      (await call('POST', '/auth/refresh', { body: { refreshToken: user.refresh } })).status,
-    ).toBe(401);
+    expect((await withSession('/auth/refresh', user.refresh)).status).toBe(401);
     expect((await login(user.email, USER_PASSWORD)).status).toBe(401);
     expect((await login(user.email, next)).status).toBe(200);
   });
@@ -831,7 +915,7 @@ describe('logs', () => {
       ADMIN_PASSWORD,
       USER_PASSWORD,
       res.body.accessToken,
-      res.body.refreshToken,
+      refreshCookie(res)!,
     ]) {
       expect(all).not.toContain(secret);
     }
@@ -849,6 +933,7 @@ describe('CORS (sprint 004)', () => {
       new FastifyAdapter(),
       { logger: { log: capture, warn: capture, error: capture, debug: capture, verbose: capture } },
     );
+    await registerSessionCookies(instance);
     configureCors(instance, corsOrigins);
     await instance.init();
     await instance.getHttpAdapter().getInstance().ready();
@@ -864,16 +949,24 @@ describe('CORS (sprint 004)', () => {
         headers: {
           origin: allowed,
           'access-control-request-method': 'POST',
-          'access-control-request-headers': 'content-type,idempotency-key,if-match,authorization',
+          'access-control-request-headers':
+            'content-type,idempotency-key,if-match,authorization,x-requested-with',
         },
       });
       expect(pre.statusCode).toBeLessThan(300);
       expect(pre.headers['access-control-allow-origin']).toBe(allowed);
       expect(String(pre.headers['access-control-allow-methods'])).toMatch(/POST/);
       const headers = String(pre.headers['access-control-allow-headers']).toLowerCase();
-      for (const name of ['authorization', 'content-type', 'idempotency-key', 'if-match']) {
+      for (const name of [
+        'authorization',
+        'content-type',
+        'idempotency-key',
+        'if-match',
+        'x-requested-with',
+      ]) {
         expect(headers).toContain(name);
       }
+      expect(pre.headers['access-control-allow-credentials']).toBe('true');
       const real = await cors.inject({
         method: 'GET',
         url: '/health',
@@ -973,9 +1066,11 @@ describe('UUID case-insensitivity (sprint 006 cycle 3)', () => {
     expect(loginEmail.body.code).toBe('VALIDATION_ERROR');
     expect(loginEmail.body.details[0].field).toBe('email');
     expect((await login('x@example.test', nul)).status).toBe(400);
-    const refresh = await call('POST', '/auth/refresh', { body: { refreshToken: nul } });
-    expect(refresh.status).toBe(400);
-    expect(refresh.body.details[0].field).toBe('refreshToken');
+    const reset = await call('POST', '/auth/password-reset/confirm', {
+      body: { token: nul, newPassword: USER_PASSWORD },
+    });
+    expect(reset.status).toBe(400);
+    expect(reset.body.details[0].field).toBe('token');
     const user = await call('POST', '/users', {
       token: adminToken,
       body: {
@@ -997,5 +1092,323 @@ describe('UUID case-insensitivity (sprint 006 cycle 3)', () => {
       body: { permissions: [nul] },
     });
     expect(perms.status).toBe(400);
+  });
+});
+
+/** Boots another application over the same database, with its own limiter and sinks. */
+async function bootApp(overrides: Partial<IdentityConfig> = {}, instanceMailer = mailer) {
+  const sink: string[] = [];
+  const capture = (...args: unknown[]) => sink.push(args.map(String).join(' '));
+  const instance = await NestFactory.create<NestFastifyApplication>(
+    AppModule.register({ ...config, ...overrides }, { mailer: instanceMailer }),
+    new FastifyAdapter(),
+    { logger: { log: capture, warn: capture, error: capture, debug: capture, verbose: capture } },
+  );
+  await registerSessionCookies(instance);
+  await instance.init();
+  await instance.getHttpAdapter().getInstance().ready();
+  return { instance, sink };
+}
+
+async function eventually(check: () => boolean, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  expect(check()).toBe(true);
+}
+
+describe('login throttling (sprint 011)', () => {
+  it('CA-6: 429 TOO_MANY_ATTEMPTS with Retry-After after the email limit; success clears the counter', async () => {
+    const { instance, sink } = await bootApp({ loginMaxAttemptsEmail: 2, loginMaxAttemptsIp: 50 });
+    try {
+      const user = await createUser(await createRole());
+      const attempt = (email: string, pwd: string) =>
+        call('POST', '/auth/login', { target: instance, body: { email, password: pwd } });
+      expect((await attempt(user.email, 'wrong-1A')).status).toBe(401);
+      expect((await attempt(user.email, 'wrong-2A')).status).toBe(401);
+      const blocked = await attempt(user.email, USER_PASSWORD);
+      expect(blocked.status).toBe(429);
+      expect(blocked.body.code).toBe('TOO_MANY_ATTEMPTS');
+      expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
+      expect(blocked.setCookie).toEqual([]);
+      expect(sink.join('\n')).toContain('auth.login.throttled');
+      expect(sink.join('\n')).not.toContain(USER_PASSWORD);
+
+      // Another account is unaffected by the first one's failures; success resets its counter.
+      const other = await createUser(await createRole());
+      expect((await attempt(other.email, 'wrong-1A')).status).toBe(401);
+      expect((await attempt(other.email, USER_PASSWORD)).status).toBe(200);
+      expect((await attempt(other.email, 'wrong-1A')).status).toBe(401);
+      expect((await attempt(other.email, USER_PASSWORD)).status).toBe(200);
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it('CA-6: 429 after the IP limit across different emails', async () => {
+    const { instance } = await bootApp({ loginMaxAttemptsEmail: 50, loginMaxAttemptsIp: 3 });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const res = await call('POST', '/auth/login', {
+          target: instance,
+          body: { email: `nobody-${i}-${unique()}@example.test`, password: 'wrong-1A' },
+        });
+        expect(res.status).toBe(401);
+      }
+      const res = await call('POST', '/auth/login', {
+        target: instance,
+        body: { email: adminEmail, password: ADMIN_PASSWORD },
+      });
+      expect(res.status).toBe(429);
+      expect(res.headers['retry-after']).toBeDefined();
+    } finally {
+      await instance.close();
+    }
+  });
+});
+
+describe('password reset (sprint 011)', () => {
+  const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+  const tokenOf = (link: string) => link.split('#token=')[1]!;
+  // Each request comes from its own address so the per-IP limit never interferes with the tests.
+  let nextIp = 0;
+  const request = (email: string, target: NestFastifyApplication) =>
+    call('POST', '/auth/password-reset/request', {
+      target,
+      ip: `10.9.${Math.floor(++nextIp / 250)}.${(nextIp % 250) + 1}`,
+      body: { email },
+    });
+  const confirm = (token: string, newPassword: string, target: NestFastifyApplication) =>
+    call('POST', '/auth/password-reset/confirm', { target, body: { token, newPassword } });
+  let reset: NestFastifyApplication;
+  let sink: string[];
+  const outbox = new FakeMailer();
+
+  beforeAll(async () => {
+    const booted = await bootApp({}, outbox);
+    reset = booted.instance;
+    sink = booted.sink;
+  });
+  afterAll(async () => {
+    await reset?.close();
+  });
+
+  async function activeUser() {
+    const user = await createUser(await createRole());
+    return user;
+  }
+  const lastMailTo = (email: string) => [...outbox.sent].reverse().find((m) => m.to === email);
+
+  it('CA-7: same 202 body for active, unknown and inactive accounts; only the active one gets mail', async () => {
+    const active = await activeUser();
+    const inactive = await activeUser();
+    await call('PATCH', `/users/${inactive.id}/status`, {
+      token: adminToken,
+      body: { isActive: false },
+    });
+    const before = outbox.sent.length;
+    const results = [
+      await request(active.email, reset),
+      await request(`nobody-${unique()}@example.test`, reset),
+      await request(inactive.email, reset),
+    ];
+    for (const res of results) expect(res.status).toBe(202);
+    expect(new Set(results.map((r) => r.raw)).size).toBe(1);
+    expect(outbox.sent.length - before).toBe(1);
+    expect(lastMailTo(active.email)).toBeDefined();
+    expect(lastMailTo(inactive.email)).toBeUndefined();
+    const { rows } = await pool.query('SELECT 1 FROM password_reset_tokens WHERE user_id = $1', [
+      inactive.id,
+    ]);
+    expect(rows).toHaveLength(0);
+    expect((await request('not-an-email', reset)).status).toBe(400);
+  });
+
+  it('CA-8: link in the fragment, only the hash in the database, a new request voids the old token', async () => {
+    const user = await activeUser();
+    await request(user.email, reset);
+    const first = lastMailTo(user.email)!;
+    expect(first.link).toMatch(
+      /^http:\/\/web\.example\.test\/restablecer#token=[A-Za-z0-9_-]{43}$/,
+    );
+    const firstToken = tokenOf(first.link);
+    const { rows } = await pool.query<{ token_hash: string }>(
+      'SELECT token_hash FROM password_reset_tokens WHERE user_id = $1',
+      [user.id],
+    );
+    expect(rows.map((r) => r.token_hash)).toEqual([sha256(firstToken)]);
+
+    await request(user.email, reset);
+    const secondToken = tokenOf(lastMailTo(user.email)!.link);
+    expect(secondToken).not.toBe(firstToken);
+    const stale = await confirm(firstToken, password(), reset);
+    expect(stale.status).toBe(400);
+    expect(stale.body.code).toBe('INVALID_RESET_TOKEN');
+    expect((await confirm(secondToken, password(), reset)).status).toBe(204);
+  });
+
+  it('CA-9: password change, token use and session revocation are one transaction', async () => {
+    const user = await activeUser();
+    const session = await login(user.email, USER_PASSWORD);
+    expect(refreshCookie(session)).toBeDefined();
+    await request(user.email, reset);
+    const tokenHash = sha256(tokenOf(lastMailTo(user.email)!.link));
+    const before = await pool.query<{ password_hash: string }>(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [user.id],
+    );
+    const repo = createRepositories(pool).passwordResetTokens;
+    // Every write is done, then the callback fails: the whole unit must roll back.
+    await expect(
+      repo.redeem(tokenHash, new Date(), async (userId, tx) => {
+        await tx.setPassword(userId, 'hash-que-no-debe-quedar');
+        await tx.revokeAllRefreshTokens(userId);
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+    const after = await pool.query<{ password_hash: string }>(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [user.id],
+    );
+    expect(after.rows[0]!.password_hash).toBe(before.rows[0]!.password_hash);
+    const used = await pool.query(
+      'SELECT 1 FROM password_reset_tokens WHERE token_hash = $1 AND used_at IS NULL',
+      [tokenHash],
+    );
+    expect(used.rows).toHaveLength(1);
+    const live = await pool.query(
+      'SELECT 1 FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL',
+      [user.id],
+    );
+    expect(live.rows.length).toBeGreaterThan(0);
+  });
+
+  it('CA-9: confirm changes the password, spends the token and revokes the sessions', async () => {
+    const user = await activeUser();
+    const session = await login(user.email, USER_PASSWORD);
+    const cookie = refreshCookie(session)!;
+    await request(user.email, reset);
+    const token = tokenOf(lastMailTo(user.email)!.link);
+    const next = password();
+    const done = await confirm(token, next, reset);
+    expect(done.status).toBe(204);
+    expect(done.raw).toBe('');
+    expect((await login(user.email, USER_PASSWORD)).status).toBe(401);
+    expect((await login(user.email, next)).status).toBe(200);
+    expect((await withSession('/auth/refresh', cookie)).status).toBe(401);
+    const { rows } = await pool.query<{ used_at: Date | null }>(
+      'SELECT used_at FROM password_reset_tokens WHERE token_hash = $1',
+      [sha256(token)],
+    );
+    expect(rows[0]!.used_at).not.toBeNull();
+    const again = await confirm(token, password(), reset);
+    expect(again.status).toBe(400);
+    expect(again.body.code).toBe('INVALID_RESET_TOKEN');
+  });
+
+  it('CA-10: expired, tampered and inactive-user tokens fail the same way; policy errors keep the token', async () => {
+    const expired = await activeUser();
+    await request(expired.email, reset);
+    const expiredToken = tokenOf(lastMailTo(expired.email)!.link);
+    await pool.query(
+      "UPDATE password_reset_tokens SET expires_at = now() - interval '1 minute' WHERE user_id = $1",
+      [expired.id],
+    );
+
+    const inactive = await activeUser();
+    await request(inactive.email, reset);
+    const inactiveToken = tokenOf(lastMailTo(inactive.email)!.link);
+    await call('PATCH', `/users/${inactive.id}/status`, {
+      token: adminToken,
+      body: { isActive: false },
+    });
+
+    const valid = await activeUser();
+    await request(valid.email, reset);
+    const validToken = tokenOf(lastMailTo(valid.email)!.link);
+    const tampered = `${validToken.slice(0, -1)}${validToken.endsWith('A') ? 'B' : 'A'}`;
+
+    const failures = [
+      await confirm(expiredToken, password(), reset),
+      await confirm(inactiveToken, password(), reset),
+      await confirm(tampered, password(), reset),
+      await confirm('short', password(), reset),
+    ];
+    for (const res of failures) {
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('INVALID_RESET_TOKEN');
+    }
+    expect(new Set(failures.map((r) => r.body.message)).size).toBe(1);
+    expect((await login(expired.email, USER_PASSWORD)).status).toBe(200);
+
+    const weak = await confirm(validToken, 'short', reset);
+    expect(weak.status).toBe(400);
+    expect(weak.body.details[0].field).toBe('newPassword');
+    expect((await confirm(validToken, password(), reset)).status).toBe(204);
+  });
+
+  it('CA-7: the per-email limit does not change the answer but stops the mail', async () => {
+    const user = await activeUser();
+    const before = outbox.sent.length;
+    const statuses: number[] = [];
+    for (let i = 0; i < 5; i++) statuses.push((await request(user.email, reset)).status);
+    expect(statuses).toEqual([202, 202, 202, 202, 202]);
+    expect(outbox.sent.length - before).toBe(3);
+    expect(sink.join('\n')).toContain('auth.password_reset.throttled');
+  });
+
+  it('CA-7: the per-IP limit also stops the mail without changing the answer', async () => {
+    const capped = new FakeMailer();
+    const { instance: limited } = await bootApp({}, capped);
+    try {
+      const users = [];
+      for (let i = 0; i < 12; i++) users.push(await activeUser());
+      for (const user of users) {
+        const res = await call('POST', '/auth/password-reset/request', {
+          target: limited,
+          ip: '10.7.7.7',
+          body: { email: user.email },
+        });
+        expect(res.status).toBe(202);
+      }
+      expect(capped.sent).toHaveLength(10);
+    } finally {
+      await limited.close();
+    }
+  });
+
+  it('CA-11: an SMTP failure still answers 202, logs auth.mail.failed and leaks no token or link', async () => {
+    const failing = new FakeMailer();
+    failing.failWith = new Error('connect ECONNREFUSED smtp.internal:25');
+    const { instance, sink: failSink } = await bootApp({}, failing);
+    try {
+      const user = await activeUser();
+      const res = await request(user.email, instance);
+      expect(res.status).toBe(202);
+      await eventually(() => failSink.join('\n').includes('auth.mail.failed'));
+      const { rows } = await pool.query<{ token_hash: string }>(
+        'SELECT token_hash FROM password_reset_tokens WHERE user_id = $1',
+        [user.id],
+      );
+      expect(rows).toHaveLength(1);
+      const all = failSink.join('\n');
+      expect(all).not.toMatch(/restablecer|token=|ECONNREFUSED/);
+      expect(all).not.toContain(rows[0]!.token_hash);
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it('CA-11: logs of the whole flow never contain tokens, links or passwords', async () => {
+    const user = await activeUser();
+    await request(user.email, reset);
+    const token = tokenOf(lastMailTo(user.email)!.link);
+    const next = password();
+    await confirm(token, next, reset);
+    const all = sink.join('\n');
+    expect(all).toContain('auth.password_reset.requested');
+    expect(all).toContain('auth.password_reset.completed');
+    for (const secret of [token, next, USER_PASSWORD, 'restablecer']) {
+      expect(all).not.toContain(secret);
+    }
   });
 });

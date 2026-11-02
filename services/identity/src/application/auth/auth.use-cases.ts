@@ -1,6 +1,7 @@
 import type {
   AccessReader,
   AccessTokenIssuer,
+  AttemptLimiter,
   PasswordHasher,
   RefreshTokenCodec,
   RefreshTokenRepository,
@@ -10,6 +11,7 @@ import type { AuditLog } from '../../domain/shared/audit-log.js';
 import {
   forbiddenError,
   notFoundError,
+  tooManyAttemptsError,
   unauthorizedError,
   validationError,
 } from '../../domain/shared/errors.js';
@@ -25,6 +27,15 @@ export interface TokenPair {
   readonly expiresIn: number;
 }
 
+/** Failed-login limits: per e-mail and per IP, inside a sliding window. */
+export interface LoginThrottle {
+  readonly limiter: AttemptLimiter;
+  readonly maxPerEmail: number;
+  readonly maxPerIp: number;
+  readonly windowSeconds: number;
+}
+
+export const TOO_MANY_ATTEMPTS_MESSAGE = 'Demasiados intentos. Inténtalo de nuevo más tarde';
 export const INVALID_CREDENTIALS_MESSAGE = 'Credenciales inválidas';
 export const INVALID_SESSION_MESSAGE = 'Sesión inválida o expirada';
 
@@ -55,17 +66,32 @@ export class LoginUseCase {
     private readonly hasher: PasswordHasher,
     private readonly tokens: TokenDeps,
     private readonly log: AuditLog,
+    private readonly throttle: LoginThrottle,
   ) {}
 
-  async execute(input: { email: string; password: string }): Promise<TokenPair> {
+  async execute(input: { email: string; password: string; ip?: string }): Promise<TokenPair> {
     const email = input.email.trim().toLowerCase();
+    const emailKey = `login:email:${email}`;
+    const ipKey = `login:ip:${input.ip ?? 'unknown'}`;
+    const { limiter, maxPerEmail, maxPerIp, windowSeconds } = this.throttle;
+    const retryAfter = Math.max(
+      limiter.retryAfter(emailKey, maxPerEmail, windowSeconds),
+      limiter.retryAfter(ipKey, maxPerIp, windowSeconds),
+    );
+    if (retryAfter > 0) {
+      this.log.warn('auth.login.throttled', { email: email.slice(0, 254), retryAfter });
+      throw tooManyAttemptsError(TOO_MANY_ATTEMPTS_MESSAGE, retryAfter);
+    }
     const found = await this.users.findWithPasswordHashByEmail(email);
     const passwordOk = await this.hasher.verify(found?.passwordHash ?? null, input.password);
     if (!found || !passwordOk || !found.user.isActive) {
       const reason = !found ? 'unknown_user' : !passwordOk ? 'bad_password' : 'inactive_user';
+      limiter.record(emailKey, windowSeconds);
+      limiter.record(ipKey, windowSeconds);
       this.log.warn('auth.login.failed', { email: email.slice(0, 254), reason });
       throw unauthorizedError(INVALID_CREDENTIALS_MESSAGE, 'INVALID_CREDENTIALS');
     }
+    limiter.reset(emailKey);
     await this.users.touchLastLogin(found.user.id, this.tokens.now());
     const pair = await issuePair(this.tokens, found.user.id);
     this.log.info('auth.login.success', { userId: found.user.id, email: found.user.email });
@@ -130,8 +156,9 @@ export class LogoutUseCase {
     private readonly log: AuditLog,
   ) {}
 
-  /** Idempotent: an unknown token is ignored so the endpoint reveals nothing. */
-  async execute(refreshToken: string): Promise<void> {
+  /** Idempotent: a missing or unknown token is ignored so the endpoint reveals nothing. */
+  async execute(refreshToken: string | undefined): Promise<void> {
+    if (!refreshToken) return;
     const record = await this.refreshTokens.findByHash(this.codec.hash(refreshToken));
     if (record && !record.revokedAt) {
       await this.refreshTokens.revoke(record.id);

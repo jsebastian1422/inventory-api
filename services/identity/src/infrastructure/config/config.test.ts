@@ -71,3 +71,55 @@ describe('identity CORS_ORIGINS', () => {
     },
   );
 });
+
+describe('identity session, throttling and mail settings', () => {
+  it('has secure defaults', () => {
+    const config = loadConfig(valid, readFile);
+    expect(config.sessionCookieSecure).toBe(true);
+    expect(config.loginMaxAttemptsEmail).toBe(5);
+    expect(config.loginMaxAttemptsIp).toBe(20);
+    expect(config.loginAttemptWindowSeconds).toBe(900);
+    expect(config.passwordResetTtlSeconds).toBe(1800);
+    expect(config.smtp).toBeNull();
+    expect(config.webAppUrl).toBeNull();
+  });
+
+  it('reads overrides from the environment', () => {
+    const config = loadConfig(
+      {
+        ...valid,
+        SESSION_COOKIE_SECURE: 'false',
+        LOGIN_MAX_ATTEMPTS_EMAIL: '2',
+        LOGIN_ATTEMPT_WINDOW: '1m',
+        PASSWORD_RESET_TTL: '10m',
+        WEB_APP_URL: 'http://localhost:5173/',
+        SMTP_HOST: 'localhost',
+        SMTP_PORT: '1025',
+        SMTP_FROM: 'Inventario <no-reply@example.test>',
+      },
+      readFile,
+    );
+    expect(config.sessionCookieSecure).toBe(false);
+    expect(config.loginMaxAttemptsEmail).toBe(2);
+    expect(config.loginAttemptWindowSeconds).toBe(60);
+    expect(config.passwordResetTtlSeconds).toBe(600);
+    expect(config.webAppUrl).toBe('http://localhost:5173');
+    expect(config.smtp).toEqual({
+      host: 'localhost',
+      port: 1025,
+      from: 'Inventario <no-reply@example.test>',
+    });
+  });
+
+  it('requires WEB_APP_URL and SMTP_FROM when SMTP_HOST is set', () => {
+    const smtp = { ...valid, SMTP_HOST: 'localhost' };
+    expect(() => loadConfig({ ...smtp, SMTP_FROM: 'a@b.co' }, readFile)).toThrow(/WEB_APP_URL/);
+    expect(() => loadConfig({ ...smtp, WEB_APP_URL: 'http://x.co' }, readFile)).toThrow(
+      /SMTP_FROM/,
+    );
+  });
+
+  it.each(['localhost:5173', 'ftp://x.com', 'nope'])('rejects WEB_APP_URL %j', (url) => {
+    expect(() => loadConfig({ ...valid, WEB_APP_URL: url }, readFile)).toThrow(/WEB_APP_URL/);
+  });
+});

@@ -4,6 +4,7 @@ import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fa
 import { loadConfig } from './infrastructure/config/config.js';
 import { AppModule } from './infrastructure/http/app.module.js';
 import { configureCors } from './infrastructure/http/cors.js';
+import { registerSessionCookies } from './infrastructure/http/session-cookie.js';
 
 async function bootstrap(): Promise<void> {
   // Validate configuration once, first: fail fast with a clear message.
@@ -12,6 +13,7 @@ async function bootstrap(): Promise<void> {
     AppModule.register(config),
     new FastifyAdapter(),
   );
+  await registerSessionCookies(app);
   configureCors(app, config.corsOrigins);
   app.enableShutdownHooks();
   await app.listen(config.port, config.host);

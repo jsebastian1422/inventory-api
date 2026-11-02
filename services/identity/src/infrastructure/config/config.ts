@@ -15,6 +15,12 @@ const duration = z
   .string()
   .regex(/^\d+[smhd]$/, 'use a number followed by s, m, h or d (for example 15m, 7d)');
 
+/** An empty value (`SMTP_HOST=` in a .env file) counts as not set. */
+const optionalText = z
+  .string()
+  .optional()
+  .transform((value) => (value && value.trim() !== '' ? value : undefined));
+
 const schema = databaseSchema.extend({
   IDENTITY_API_PORT: port.default(3001),
   API_HOST: z.string().min(1).default('0.0.0.0'),
@@ -25,6 +31,17 @@ const schema = databaseSchema.extend({
   ACCESS_TOKEN_TTL: duration.default('15m'),
   REFRESH_TOKEN_TTL: duration.default('7d'),
   CORS_ORIGINS: z.string().optional(),
+  SESSION_COOKIE_SECURE: z.enum(['true', 'false']).default('true'),
+  LOGIN_MAX_ATTEMPTS_EMAIL: z.coerce.number().int().min(1).default(5),
+  LOGIN_MAX_ATTEMPTS_IP: z.coerce.number().int().min(1).default(20),
+  LOGIN_ATTEMPT_WINDOW: duration.default('15m'),
+  PASSWORD_RESET_TTL: duration.default('30m'),
+  WEB_APP_URL: z.string().optional(),
+  SMTP_HOST: optionalText,
+  SMTP_PORT: port.default(587),
+  SMTP_USER: optionalText,
+  SMTP_PASSWORD: optionalText,
+  SMTP_FROM: optionalText,
 });
 
 export interface DatabaseConfig {
@@ -33,6 +50,14 @@ export interface DatabaseConfig {
   readonly user: string;
   readonly password: string;
   readonly database: string;
+}
+
+export interface SmtpConfig {
+  readonly host: string;
+  readonly port: number;
+  readonly user?: string;
+  readonly password?: string;
+  readonly from: string;
 }
 
 export interface IdentityConfig {
@@ -45,6 +70,16 @@ export interface IdentityConfig {
   readonly refreshTokenTtlSeconds: number;
   /** Allowed browser origins; empty = CORS disabled. */
   readonly corsOrigins: readonly string[];
+  /** Secure flag of the session cookie: true everywhere except local development over http. */
+  readonly sessionCookieSecure: boolean;
+  readonly loginMaxAttemptsEmail: number;
+  readonly loginMaxAttemptsIp: number;
+  readonly loginAttemptWindowSeconds: number;
+  readonly passwordResetTtlSeconds: number;
+  /** Public URL of the web app without trailing slash; null when not configured. */
+  readonly webAppUrl: string | null;
+  /** null = mail not configured (password-reset mails fail and are logged). */
+  readonly smtp: SmtpConfig | null;
 }
 
 export class ConfigError extends Error {}
@@ -73,6 +108,40 @@ export function parseCorsOrigins(raw: string | undefined): string[] {
     }
   }
   return origins;
+}
+
+/** Parses WEB_APP_URL: an http(s) URL; the trailing slash is dropped. */
+export function parseWebAppUrl(raw: string | undefined): string | null {
+  const value = (raw ?? '').trim();
+  if (value === '') return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      return value.replace(/\/+$/, '');
+    }
+  } catch {
+    // Falls through to the error below.
+  }
+  throw new ConfigError(
+    `Invalid configuration. WEB_APP_URL: "${value}" is not a valid http(s) URL`,
+  );
+}
+
+function toSmtpConfig(data: z.infer<typeof schema>, webAppUrl: string | null): SmtpConfig | null {
+  if (!data.SMTP_HOST) return null;
+  if (!data.SMTP_FROM) {
+    throw new ConfigError('Invalid configuration. SMTP_FROM: required when SMTP_HOST is set');
+  }
+  if (!webAppUrl) {
+    throw new ConfigError('Invalid configuration. WEB_APP_URL: required when SMTP_HOST is set');
+  }
+  return {
+    host: data.SMTP_HOST,
+    port: data.SMTP_PORT,
+    from: data.SMTP_FROM,
+    ...(data.SMTP_USER ? { user: data.SMTP_USER } : {}),
+    ...(data.SMTP_PASSWORD ? { password: data.SMTP_PASSWORD } : {}),
+  };
 }
 
 type ReadFile = (path: string) => string;
@@ -139,6 +208,7 @@ export function loadConfig(
     );
   }
   const data = result.data;
+  const webAppUrl = parseWebAppUrl(data.WEB_APP_URL);
   return {
     port: data.IDENTITY_API_PORT,
     host: data.API_HOST,
@@ -158,5 +228,12 @@ export function loadConfig(
     accessTokenTtlSeconds: toSeconds(data.ACCESS_TOKEN_TTL),
     refreshTokenTtlSeconds: toSeconds(data.REFRESH_TOKEN_TTL),
     corsOrigins: parseCorsOrigins(data.CORS_ORIGINS),
+    sessionCookieSecure: data.SESSION_COOKIE_SECURE === 'true',
+    loginMaxAttemptsEmail: data.LOGIN_MAX_ATTEMPTS_EMAIL,
+    loginMaxAttemptsIp: data.LOGIN_MAX_ATTEMPTS_IP,
+    loginAttemptWindowSeconds: toSeconds(data.LOGIN_ATTEMPT_WINDOW),
+    passwordResetTtlSeconds: toSeconds(data.PASSWORD_RESET_TTL),
+    webAppUrl,
+    smtp: toSmtpConfig(data, webAppUrl),
   };
 }

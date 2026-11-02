@@ -23,18 +23,23 @@ Node.js 24+, npm, Docker y Docker Compose. Docker Desktop debe estar encendido a
 
 Copia el ejemplo y ajustalo: `cp .env.example .env` (`.env` no se versiona).
 
-| Variable                                              | Descripcion                                                  |
-| ----------------------------------------------------- | ------------------------------------------------------------ |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credenciales y base de datos                                 |
-| `POSTGRES_PORT`                                       | Puerto publicado en el host (cambialo si 5432 esta ocupado)  |
-| `POSTGRES_HOST`                                       | Host de la BD visto desde la API (`localhost`)               |
-| `API_HOST` / `API_PORT`                               | Direccion de la API y puerto de `core`                       |
-| `IDENTITY_API_PORT`                                   | Puerto de identity (3001 por defecto)                        |
-| `JWT_PRIVATE_KEY_PATH` o `JWT_PRIVATE_KEY`            | Clave privada ES256 (PKCS8 PEM): ruta o contenido            |
-| `JWT_PUBLIC_KEY_PATH` o `JWT_PUBLIC_KEY`              | Clave publica (SPKI PEM): ruta o contenido (identity y core) |
-| `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL`              | Vigencias (`15m`, `7d`; numero + s/m/h/d)                    |
-| `CORS_ORIGINS`                                        | Origenes permitidos (core e identity), separados por comas   |
-| `POSTGRES_TEST_DB`                                    | BD de pruebas de integracion (`inventory_test`)              |
+| Variable                                                                      | Descripcion                                                                             |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`                         | Credenciales y base de datos                                                            |
+| `POSTGRES_PORT`                                                               | Puerto publicado en el host (cambialo si 5432 esta ocupado)                             |
+| `POSTGRES_HOST`                                                               | Host de la BD visto desde la API (`localhost`)                                          |
+| `API_HOST` / `API_PORT`                                                       | Direccion de la API y puerto de `core`                                                  |
+| `IDENTITY_API_PORT`                                                           | Puerto de identity (3001 por defecto)                                                   |
+| `JWT_PRIVATE_KEY_PATH` o `JWT_PRIVATE_KEY`                                    | Clave privada ES256 (PKCS8 PEM): ruta o contenido                                       |
+| `JWT_PUBLIC_KEY_PATH` o `JWT_PUBLIC_KEY`                                      | Clave publica (SPKI PEM): ruta o contenido (identity y core)                            |
+| `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL`                                      | Vigencias (`15m`, `7d`; numero + s/m/h/d)                                               |
+| `CORS_ORIGINS`                                                                | Origenes permitidos (core e identity), separados por comas                              |
+| `SESSION_COOKIE_SECURE`                                                       | identity: `Secure` de la cookie de sesion (`true`; `false` solo en desarrollo por http) |
+| `LOGIN_MAX_ATTEMPTS_EMAIL` / `LOGIN_MAX_ATTEMPTS_IP` / `LOGIN_ATTEMPT_WINDOW` | identity: limite de logins fallidos (5 por correo, 20 por IP, ventana `15m`)            |
+| `PASSWORD_RESET_TTL`                                                          | identity: vigencia del enlace de recuperacion (`30m`)                                   |
+| `WEB_APP_URL`                                                                 | identity: URL publica de inventory-web (para el enlace del correo)                      |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM`       | identity: servidor de correo (sin `SMTP_HOST` no se envian correos)                     |
+| `POSTGRES_TEST_DB`                                                            | BD de pruebas de integracion (`inventory_test`)                                         |
 
 Las credenciales de `.env.example` (`change_me`) son solo de ejemplo: cambialas en tu `.env`.
 Los puertos deben estar entre 1 y 65535.
@@ -42,7 +47,8 @@ Los puertos deben estar entre 1 y 65535.
 `CORS_ORIGINS` es opcional: lista de origenes exactos (`http://localhost:5173,https://app.example.com`),
 sin ruta ni `/` final. Vacia o ausente = sin CORS. Un origen mal formado hace fallar el arranque indicando
 la variable. Se permiten los metodos `GET, POST, PUT, PATCH, DELETE, OPTIONS` y las cabeceras
-`Authorization, Content-Type, Idempotency-Key, If-Match` (sin cookies ni comodin).
+`Authorization, Content-Type, Idempotency-Key, If-Match, X-Requested-With` (sin comodin). identity responde con
+`Access-Control-Allow-Credentials: true` (la cookie de sesion) y expone `Retry-After`; core no usa cookies.
 
 Si falta una variable requerida, la API termina al arrancar indicando cual.
 
@@ -93,6 +99,9 @@ Migraciones actuales (11):
 `establishments`) e identity 2 (`identity-seed`, luego `identity-tables`); el catalogo y los inventarios 3 (`catalog-inventory-permissions`, `inventories`, luego `catalog`); el alcance por local 2 (`scope-permissions`, luego `establishment-users`); para volver a
 la BD vacia hacen falta 11. Revertir la semilla de identity falla si ya hay usuarios con el rol Administrador (la FK lo impide).
 
+Sprint 011: `password-reset-tokens` (tabla `password_reset_tokens`: hash SHA-256 del token, vencimiento, uso; FK a
+`users` con `ON DELETE CASCADE`); un `migrate:down` la revierte.
+
 Las migraciones cuyo `down` contiene `DROP` (todas las que eliminan tablas, columnas o indices) las aplica
 una persona, no los agentes: el hook de politica del proyecto bloquea esos comandos.
 
@@ -133,6 +142,7 @@ Todos exigen `Authorization: Bearer <accessToken>` salvo los publicos. Errores e
 | Metodo y ruta                                                                | Permiso            |
 | ---------------------------------------------------------------------------- | ------------------ |
 | `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /health` | publico            |
+| `POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`     | publico            |
 | `GET /auth/me`, `POST /auth/change-password`                                 | autenticado        |
 | `GET /users`, `GET /users/:id`                                               | `users.read`       |
 | `POST /users`                                                                | `users.create`     |
@@ -146,6 +156,54 @@ Todos exigen `Authorization: Bearer <accessToken>` salvo los publicos. Errores e
 Contrasena: minimo 8 caracteres (maximo 128), al menos una letra y un numero. El access token dura 15 min;
 el refresh token es opaco, dura 7 dias y rota en cada uso (reutilizar uno ya usado cierra todas las sesiones
 del usuario). Desactivar a un usuario o cambiar/restablecer su contrasena revoca sus refresh tokens.
+
+### Sesion web con cookie (ADR-0007, sprint 011)
+
+El refresh token viaja **solo** en la cookie `inv_rt` (`HttpOnly; SameSite=Strict; Path=/auth`, y `Secure` si
+`SESSION_COOKIE_SECURE=true`, el valor por defecto; ponlo en `false` solo en desarrollo local por http). Ya no
+se devuelve ni se acepta en el cuerpo (**contrato incompatible** con los clientes anteriores).
+
+| Endpoint                              | Entrada                                                                     | Respuesta                                                                                                                            |
+| ------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST /auth/login` `{email,password}` | cuerpo                                                                      | 200 `{accessToken, tokenType, expiresIn}` + `Set-Cookie: inv_rt`; 401 `INVALID_CREDENTIALS`; 429 `TOO_MANY_ATTEMPTS` + `Retry-After` |
+| `POST /auth/refresh`                  | sin cuerpo: cookie + `Origin` permitido + `X-Requested-With: inventory-web` | 200 como login (cookie rotada); 401 `INVALID_SESSION` (borra la cookie); 403 `CSRF_REJECTED`                                         |
+| `POST /auth/logout`                   | igual que refresh                                                           | 204 siempre (sin cookie no hace nada) y borra la cookie; 403 `CSRF_REJECTED`                                                         |
+
+- **CSRF:** `refresh` y `logout` exigen un `Origin` dentro de `CORS_ORIGINS` y la cabecera `X-Requested-With:
+inventory-web` (fuerza el preflight de CORS). Con `CORS_ORIGINS` vacio, ambos responden 403.
+- **Mismo sitio:** inventory-web e identity deben desplegarse en el mismo sitio (mismo dominio registrable, por
+  ejemplo `app.x.com` y `auth.x.com`), o la cookie `SameSite=Strict` no viaja. En desarrollo, `localhost:5173` y
+  `localhost:3001` lo son.
+- **Limite de intentos:** los logins fallidos se cuentan por correo (`LOGIN_MAX_ATTEMPTS_EMAIL`, 5) y por IP
+  (`LOGIN_MAX_ATTEMPTS_IP`, 20) en una ventana deslizante (`LOGIN_ATTEMPT_WINDOW`, 15m). Superado el limite se
+  responde 429 antes de verificar la contrasena (log `auth.login.throttled`); un login correcto limpia el
+  contador del correo. El contador vive en la memoria del proceso: se reinicia con identity y no se comparte
+  entre instancias (el puerto `AttemptLimiter` permite cambiarlo). Detras de un proxy inverso todas las
+  peticiones tendrian la misma IP: configura `trustProxy` antes de ese despliegue.
+- **CSP recomendada** para servir inventory-web: `default-src 'self'; connect-src 'self' <URL de identity> <URL de
+core>; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'`.
+
+### Recuperacion de contrasena por correo (ADR-0008, sprint 011)
+
+1. `POST /auth/password-reset/request` `{email}` -> **202** `{message}` siempre igual (cuenta activa, inexistente,
+   inactiva o con limite superado); 400 solo si el formato del correo es invalido. Para una cuenta activa invalida
+   los enlaces anteriores, crea un token de 32 bytes (se guarda solo su SHA-256, vigencia `PASSWORD_RESET_TTL`,
+   un solo uso) y envia el correo sin esperar al SMTP. Limite: 3 solicitudes por correo y 10 por IP cada 15 min
+   (si se supera: 202 sin correo, log `auth.password_reset.throttled`).
+2. El correo lleva `${WEB_APP_URL}/restablecer#token=<token>` (en el fragmento, para que no viaje en `Referer`
+   ni en logs).
+3. `POST /auth/password-reset/confirm` `{token, newPassword}` -> **204**; 400 `INVALID_RESET_TOKEN` (vencido, usado,
+   alterado o usuario inactivo: mismo mensaje) o 400 `VALIDATION_ERROR` con `details` si la contrasena no cumple la
+   politica (el token no se consume). Al confirmar se revocan todas las sesiones del usuario.
+
+Si el envio falla se registra `auth.mail.failed` y la respuesta sigue siendo 202. Los logs nunca incluyen tokens,
+enlaces ni contrasenas.
+
+**Correo en desarrollo (Mailpit):** `docker compose up -d mailpit` (SMTP `localhost:1025`, bandeja en
+http://localhost:8025; no toca el contenedor de postgres). Variables: `SMTP_HOST=localhost`, `SMTP_PORT=1025`,
+`SMTP_FROM="Inventario <no-reply@inventario.local>"`, `WEB_APP_URL=http://localhost:5173`. Con `SMTP_HOST` definido
+`WEB_APP_URL` y `SMTP_FROM` son obligatorios. En produccion apunta `SMTP_*` al proveedor y configura SPF/DKIM del
+dominio remitente.
 
 ### Proteger endpoints (en identity o servicios futuros)
 

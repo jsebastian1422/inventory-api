@@ -9,6 +9,10 @@ import {
   RefreshSessionUseCase,
 } from '../../application/auth/auth.use-cases.js';
 import {
+  ConfirmPasswordResetUseCase,
+  RequestPasswordResetUseCase,
+} from '../../application/auth/password-reset.use-cases.js';
+import {
   CreateRoleUseCase,
   DeleteRoleUseCase,
   GetRoleUseCase,
@@ -25,15 +29,19 @@ import {
   SetUserStatusUseCase,
   UpdateUserUseCase,
 } from '../../application/users/user.use-cases.js';
+import type { Mailer } from '../../domain/auth/ports.js';
 import type { AuditLog } from '../../domain/shared/audit-log.js';
 import type { IdentityConfig } from '../config/config.js';
 import { PostgresAccessReader } from '../database/postgres-access-reader.js';
 import { PostgresHealthCheck } from '../database/postgres-health-check.js';
+import { PostgresPasswordResetTokenRepository } from '../database/postgres-password-reset-token-repository.js';
 import { PostgresPermissionRepository } from '../database/postgres-permission-repository.js';
 import { PostgresRefreshTokenRepository } from '../database/postgres-refresh-token-repository.js';
 import { PostgresRoleRepository } from '../database/postgres-role-repository.js';
 import { PostgresUserRepository } from '../database/postgres-user-repository.js';
+import { DisabledMailer, SmtpMailer } from '../mail/smtp-mailer.js';
 import { Argon2PasswordHasher } from '../security/argon2-password-hasher.js';
+import { InMemoryAttemptLimiter } from '../security/in-memory-attempt-limiter.js';
 import { JwtAccessTokenIssuer } from '../security/jwt-access-token-issuer.js';
 import { RandomRefreshTokenCodec } from '../security/random-refresh-token-codec.js';
 
@@ -43,12 +51,18 @@ export function createRepositories(pool: Pool) {
     roles: new PostgresRoleRepository(pool),
     permissions: new PostgresPermissionRepository(pool),
     refreshTokens: new PostgresRefreshTokenRepository(pool),
+    passwordResetTokens: new PostgresPasswordResetTokenRepository(pool),
     access: new PostgresAccessReader(pool),
   };
 }
 
 /** Composition root: wires ports to adapters and builds every use case once. */
-export function createUseCases(config: IdentityConfig, pool: Pool, log: AuditLog) {
+export function createUseCases(
+  config: IdentityConfig,
+  pool: Pool,
+  log: AuditLog,
+  overrides: { mailer?: Mailer } = {},
+) {
   const repos = createRepositories(pool);
   const hasher = new Argon2PasswordHasher();
   const tokens = {
@@ -58,11 +72,32 @@ export function createUseCases(config: IdentityConfig, pool: Pool, log: AuditLog
     refreshTtlSeconds: config.refreshTokenTtlSeconds,
     now: () => new Date(),
   };
+  const limiter = new InMemoryAttemptLimiter();
+  const resetDeps = {
+    users: repos.users,
+    resetTokens: repos.passwordResetTokens,
+    refreshTokens: repos.refreshTokens,
+    codec: tokens.codec,
+    hasher,
+    mailer: overrides.mailer ?? (config.smtp ? new SmtpMailer(config.smtp) : new DisabledMailer()),
+    limiter,
+    log,
+    webAppUrl: config.webAppUrl,
+    ttlSeconds: config.passwordResetTtlSeconds,
+    now: tokens.now,
+  };
   return {
     health: new CheckHealthUseCase(new PostgresHealthCheck(pool)),
-    login: new LoginUseCase(repos.users, hasher, tokens, log),
+    login: new LoginUseCase(repos.users, hasher, tokens, log, {
+      limiter,
+      maxPerEmail: config.loginMaxAttemptsEmail,
+      maxPerIp: config.loginMaxAttemptsIp,
+      windowSeconds: config.loginAttemptWindowSeconds,
+    }),
     refresh: new RefreshSessionUseCase(repos.users, tokens, log),
     logout: new LogoutUseCase(repos.refreshTokens, tokens.codec, log),
+    requestPasswordReset: new RequestPasswordResetUseCase(resetDeps),
+    confirmPasswordReset: new ConfirmPasswordResetUseCase(resetDeps),
     me: new GetCurrentUserUseCase(repos.users, repos.access),
     changePassword: new ChangeOwnPasswordUseCase(repos.users, hasher, repos.refreshTokens, log),
     authorize: new AuthorizeRequestUseCase(repos.access),

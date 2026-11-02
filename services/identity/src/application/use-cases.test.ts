@@ -3,9 +3,16 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   ChangeOwnPasswordUseCase,
   LoginUseCase,
+  type LoginThrottle,
   LogoutUseCase,
   RefreshSessionUseCase,
 } from './auth/auth.use-cases.js';
+import {
+  ConfirmPasswordResetUseCase,
+  RequestPasswordResetUseCase,
+  RESET_MAX_REQUESTS_EMAIL,
+  type PasswordResetDeps,
+} from './auth/password-reset.use-cases.js';
 import {
   DeleteRoleUseCase,
   SetRolePermissionsUseCase,
@@ -21,7 +28,10 @@ import {
   FakeCodec,
   FakeHasher,
   FakeIssuer,
+  FakeAttemptLimiter,
   FakeLog,
+  FakeMailer,
+  FakePasswordResetTokens,
   FakePermissions,
   FakeRefreshTokens,
   FakeRoles,
@@ -46,6 +56,31 @@ let log: FakeLog;
 let codec: FakeCodec;
 const hasher = new FakeHasher();
 
+let limiter: FakeAttemptLimiter;
+let mailer: FakeMailer;
+let resetTokens: FakePasswordResetTokens;
+
+function throttle(): LoginThrottle {
+  return { limiter, maxPerEmail: 3, maxPerIp: 5, windowSeconds: 900 };
+}
+
+function resetDeps(overrides: Partial<PasswordResetDeps> = {}): PasswordResetDeps {
+  return {
+    users,
+    resetTokens,
+    refreshTokens: refresh,
+    codec,
+    hasher,
+    mailer,
+    limiter,
+    log,
+    webAppUrl: 'http://localhost:5173',
+    ttlSeconds: 1800,
+    now: () => now,
+    ...overrides,
+  };
+}
+
 function deps() {
   return {
     issuer: new FakeIssuer(),
@@ -63,13 +98,16 @@ beforeEach(() => {
   refresh = new FakeRefreshTokens();
   log = new FakeLog();
   codec = new FakeCodec();
+  limiter = new FakeAttemptLimiter(() => now.getTime());
+  mailer = new FakeMailer();
+  resetTokens = new FakePasswordResetTokens(users, refresh);
 });
 
 describe('LoginUseCase', () => {
   it('returns a token pair for valid credentials and logs success', async () => {
     const role = roles.add({ name: 'Administrador', isSystem: true });
     const u = users.add({ email: 'a@b.co', password: 'Secret123', role });
-    const pair = await new LoginUseCase(users, hasher, deps(), log).execute({
+    const pair = await new LoginUseCase(users, hasher, deps(), log, throttle()).execute({
       email: 'A@B.co',
       password: 'Secret123',
     });
@@ -81,7 +119,7 @@ describe('LoginUseCase', () => {
   it('gives the same error for unknown email and wrong password, and never logs the password', async () => {
     const role = roles.add({ name: 'R' });
     users.add({ email: 'a@b.co', password: 'Secret123', role });
-    const login = new LoginUseCase(users, hasher, deps(), log);
+    const login = new LoginUseCase(users, hasher, deps(), log, throttle());
     const errors = await Promise.all([
       login.execute({ email: 'nobody@b.co', password: 'Secret123' }).catch((e) => e),
       login.execute({ email: 'a@b.co', password: 'WrongPass1' }).catch((e) => e),
@@ -95,7 +133,7 @@ describe('LoginUseCase', () => {
     const role = roles.add({ name: 'R' });
     users.add({ email: 'a@b.co', role, isActive: false });
     await expect(
-      new LoginUseCase(users, hasher, deps(), log).execute({
+      new LoginUseCase(users, hasher, deps(), log, throttle()).execute({
         email: 'a@b.co',
         password: 'Secret123',
       }),
@@ -103,11 +141,60 @@ describe('LoginUseCase', () => {
   });
 });
 
+describe('LoginUseCase throttling', () => {
+  function setup() {
+    const role = roles.add({ name: 'R' });
+    users.add({ email: 'a@b.co', password: 'Secret123', role });
+    return new LoginUseCase(users, hasher, deps(), log, throttle());
+  }
+  const bad = { email: 'a@b.co', password: 'Wrong123', ip: '10.0.0.1' };
+
+  it('blocks after the email limit with a Retry-After and logs auth.login.throttled', async () => {
+    const login = setup();
+    for (let i = 0; i < 3; i++) await login.execute(bad).catch(() => undefined);
+    now = new Date(now.getTime() + 60_000);
+    await expect(
+      login.execute({ email: 'a@b.co', password: 'Secret123', ip: '10.0.0.2' }),
+    ).rejects.toMatchObject({
+      kind: 'rate_limited',
+      code: 'TOO_MANY_ATTEMPTS',
+      retryAfterSeconds: 840,
+    });
+    expect(log.events.map((e) => e.event)).toContain('auth.login.throttled');
+    expect(JSON.stringify(log.events)).not.toMatch(/Secret123|Wrong123/);
+  });
+
+  it('blocks by IP across different emails and lets the window expire', async () => {
+    const login = setup();
+    for (let i = 0; i < 5; i++) {
+      await login.execute({ ...bad, email: `x${i}@b.co` }).catch(() => undefined);
+    }
+    await expect(
+      login.execute({ email: 'a@b.co', password: 'Secret123', ip: bad.ip }),
+    ).rejects.toMatchObject({ kind: 'rate_limited' });
+    now = new Date(now.getTime() + 901_000);
+    await expect(
+      login.execute({ email: 'a@b.co', password: 'Secret123', ip: bad.ip }),
+    ).resolves.toBeDefined();
+  });
+
+  it('a successful login clears the email counter', async () => {
+    const login = setup();
+    await login.execute(bad).catch(() => undefined);
+    await login.execute(bad).catch(() => undefined);
+    await login.execute({ email: 'a@b.co', password: 'Secret123', ip: '10.0.0.9' });
+    for (let i = 0; i < 2; i++) await login.execute(bad).catch(() => undefined);
+    await expect(
+      login.execute({ email: 'a@b.co', password: 'Secret123', ip: '10.0.0.9' }),
+    ).resolves.toBeDefined();
+  });
+});
+
 describe('RefreshSessionUseCase / LogoutUseCase', () => {
   async function loggedIn() {
     const role = roles.add({ name: 'R' });
     const u = users.add({ email: 'a@b.co', role });
-    const pair = await new LoginUseCase(users, hasher, deps(), log).execute({
+    const pair = await new LoginUseCase(users, hasher, deps(), log, throttle()).execute({
       email: 'a@b.co',
       password: 'Secret123',
     });
@@ -151,6 +238,7 @@ describe('RefreshSessionUseCase / LogoutUseCase', () => {
     const logout = new LogoutUseCase(refresh, codec, log);
     await logout.execute(pair.refreshToken);
     await expect(logout.execute('unknown')).resolves.toBeUndefined();
+    await expect(logout.execute(undefined)).resolves.toBeUndefined();
     await expect(
       new RefreshSessionUseCase(users, deps(), log).execute(pair.refreshToken),
     ).rejects.toBeDefined();
@@ -416,5 +504,135 @@ describe('self password reset (CA-22)', () => {
       message: expect.stringContaining('/auth/change-password'),
     });
     expect((await users.findWithPasswordHashById(me.id))!.passwordHash).not.toBe('hash:NewPass123');
+  });
+});
+
+describe('password reset', () => {
+  function active(email = 'a@b.co') {
+    const role = roles.add({ name: `R-${email}` });
+    return users.add({ email, password: 'Secret123', role });
+  }
+  const tokenOf = (link: string) => link.split('#token=')[1]!;
+
+  it('mails a fragment link for an active user and stores only the hash', async () => {
+    const u = active();
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await request.execute({ email: ' A@B.co ', ip: '1.1.1.1' });
+    await request.drain();
+    expect(mailer.sent).toHaveLength(1);
+    expect(mailer.sent[0]!.link).toMatch(/^http:\/\/localhost:5173\/restablecer#token=rt-1$/);
+    expect(mailer.sent[0]!.to).toBe('a@b.co');
+    expect(resetTokens.tokens[0]!.tokenHash).toBe('h(rt-1)');
+    expect(JSON.stringify(resetTokens.tokens)).not.toContain('"rt-1"');
+    expect(resetTokens.activeFor(u.id)).toBe(1);
+    expect(JSON.stringify(log.events)).not.toContain('rt-1');
+  });
+
+  it('sends nothing for unknown or inactive accounts', async () => {
+    const off = active('off@b.co');
+    await users.setActive(off.id, false);
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await request.execute({ email: 'nobody@b.co' });
+    await request.execute({ email: 'off@b.co' });
+    await request.drain();
+    expect(mailer.sent).toHaveLength(0);
+    expect(resetTokens.tokens).toHaveLength(0);
+  });
+
+  it('rejects a malformed e-mail with a validation error', async () => {
+    await expect(
+      new RequestPasswordResetUseCase(resetDeps()).execute({ email: 'not-an-email' }),
+    ).rejects.toMatchObject({ kind: 'validation' });
+  });
+
+  it('a new request invalidates the previous token', async () => {
+    const u = active();
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await request.execute({ email: 'a@b.co' });
+    await request.execute({ email: 'a@b.co' });
+    await request.drain();
+    expect(resetTokens.activeFor(u.id)).toBe(1);
+    const confirm = new ConfirmPasswordResetUseCase(resetDeps());
+    await expect(
+      confirm.execute({ token: tokenOf(mailer.sent[0]!.link), newPassword: 'NewPass123' }),
+    ).rejects.toMatchObject({ code: 'INVALID_RESET_TOKEN' });
+    await expect(
+      confirm.execute({ token: tokenOf(mailer.sent[1]!.link), newPassword: 'NewPass123' }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('over the limit it stays silent: no token, no mail, a throttled log', async () => {
+    active();
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    for (let i = 0; i < RESET_MAX_REQUESTS_EMAIL + 2; i++) {
+      await request.execute({ email: 'a@b.co', ip: '2.2.2.2' });
+    }
+    await request.drain();
+    expect(mailer.sent).toHaveLength(RESET_MAX_REQUESTS_EMAIL);
+    expect(log.events.map((e) => e.event)).toContain('auth.password_reset.throttled');
+  });
+
+  it('a mail failure is logged as auth.mail.failed without the link and does not throw', async () => {
+    active();
+    mailer.failWith = new Error('connect ECONNREFUSED smtp.example');
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await expect(request.execute({ email: 'a@b.co' })).resolves.toBeUndefined();
+    await request.drain();
+    expect(log.events.map((e) => e.event)).toContain('auth.mail.failed');
+    expect(JSON.stringify(log.events)).not.toMatch(/rt-1|restablecer|ECONNREFUSED/);
+  });
+
+  it('confirm changes the password once, consumes the token and revokes sessions', async () => {
+    const u = active();
+    await refresh.create({ userId: u.id, tokenHash: 'x', expiresAt: new Date('2030-01-01') });
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await request.execute({ email: 'a@b.co' });
+    await request.drain();
+    const token = tokenOf(mailer.sent[0]!.link);
+    const confirm = new ConfirmPasswordResetUseCase(resetDeps());
+    await confirm.execute({ token, newPassword: 'NewPass123' });
+    expect((await users.findWithPasswordHashById(u.id))!.passwordHash).toBe('hash:NewPass123');
+    expect(refresh.activeFor(u.id)).toBe(0);
+    expect(log.events.map((e) => e.event)).toContain('auth.password_reset.completed');
+    await expect(confirm.execute({ token, newPassword: 'Other1234' })).rejects.toMatchObject({
+      kind: 'validation',
+      code: 'INVALID_RESET_TOKEN',
+    });
+  });
+
+  it('rejects expired, unknown and inactive-user tokens with the same generic error', async () => {
+    const u = active();
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await request.execute({ email: 'a@b.co' });
+    await request.drain();
+    const token = tokenOf(mailer.sent[0]!.link);
+    const confirm = new ConfirmPasswordResetUseCase(resetDeps());
+    const errors = [];
+    errors.push(
+      await confirm.execute({ token: 'forged', newPassword: 'NewPass123' }).catch((e) => e),
+    );
+    await users.setActive(u.id, false);
+    errors.push(await confirm.execute({ token, newPassword: 'NewPass123' }).catch((e) => e));
+    await users.setActive(u.id, true);
+    now = new Date(now.getTime() + 1801_000);
+    errors.push(await confirm.execute({ token, newPassword: 'NewPass123' }).catch((e) => e));
+    for (const error of errors) expect(error).toMatchObject({ code: 'INVALID_RESET_TOKEN' });
+    expect(new Set(errors.map((e) => e.message)).size).toBe(1);
+    expect((await users.findWithPasswordHashById(u.id))!.passwordHash).toBe('hash:Secret123');
+  });
+
+  it('a policy violation is a 400 with details and does not burn the token', async () => {
+    const u = active();
+    const request = new RequestPasswordResetUseCase(resetDeps());
+    await request.execute({ email: 'a@b.co' });
+    await request.drain();
+    const token = tokenOf(mailer.sent[0]!.link);
+    const confirm = new ConfirmPasswordResetUseCase(resetDeps());
+    await expect(confirm.execute({ token, newPassword: 'short' })).rejects.toMatchObject({
+      kind: 'validation',
+      details: [{ field: 'newPassword' }],
+    });
+    expect(resetTokens.activeFor(u.id)).toBe(1);
+    await expect(confirm.execute({ token, newPassword: 'NewPass123' })).resolves.toBeUndefined();
   });
 });

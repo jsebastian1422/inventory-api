@@ -15,7 +15,12 @@ export const text = () =>
 export const idSchema = z.uuid().transform((value) => value.toLowerCase());
 
 export const loginSchema = z.object({ email: text().max(254), password: text().max(256) });
-export const refreshSchema = z.object({ refreshToken: text().min(1).max(512) });
+export const passwordResetRequestSchema = z.object({ email: text().max(254) });
+/** The token format is not enforced here: a malformed one is answered as INVALID_RESET_TOKEN. */
+export const passwordResetConfirmSchema = z.object({
+  token: text().min(1).max(256),
+  newPassword: text().max(256),
+});
 export const changePasswordSchema = z.object({
   currentPassword: text().max(256),
   newPassword: text().max(256),

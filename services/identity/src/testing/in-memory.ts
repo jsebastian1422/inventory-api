@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type {
   AccessReader,
   AccessTokenIssuer,
+  AttemptLimiter,
+  Mailer,
   PasswordHasher,
+  PasswordResetMail,
+  PasswordResetTokenRepository,
+  PasswordResetTransaction,
   RefreshTokenCodec,
   RefreshTokenRecord,
   RefreshTokenRepository,
@@ -238,5 +243,84 @@ export class FakeAccess implements AccessReader {
       isActive: user.isActive,
       permissions: this.roles.roles.get(user.role.id)?.permissions ?? [],
     };
+  }
+}
+
+/** Fake mailer that records messages; set `failWith` to simulate an SMTP outage. */
+export class FakeMailer implements Mailer {
+  sent: PasswordResetMail[] = [];
+  failWith: Error | null = null;
+  async sendPasswordReset(mail: PasswordResetMail) {
+    if (this.failWith) throw this.failWith;
+    this.sent.push(mail);
+  }
+}
+
+interface FakeResetToken {
+  readonly id: string;
+  readonly userId: string;
+  readonly tokenHash: string;
+  readonly expiresAt: Date;
+  usedAt: Date | null;
+}
+
+export class FakePasswordResetTokens implements PasswordResetTokenRepository {
+  tokens: FakeResetToken[] = [];
+  constructor(
+    private readonly users: FakeUsers,
+    private readonly refreshTokens: FakeRefreshTokens,
+  ) {}
+  async replaceForUser(userId: string, data: { tokenHash: string; expiresAt: Date }, now: Date) {
+    for (const t of this.tokens) if (t.userId === userId && !t.usedAt) t.usedAt = now;
+    this.tokens.push({ id: randomUUID(), userId, usedAt: null, ...data });
+  }
+  async redeem(
+    tokenHash: string,
+    now: Date,
+    apply: (userId: string, tx: PasswordResetTransaction) => Promise<void>,
+  ) {
+    const token = this.tokens.find(
+      (t) => t.tokenHash === tokenHash && !t.usedAt && t.expiresAt.getTime() > now.getTime(),
+    );
+    if (!token) return false;
+    token.usedAt = now;
+    try {
+      await apply(token.userId, {
+        isUserActive: async (id) => (await this.users.findById(id))?.isActive === true,
+        setPassword: (id, hash) => this.users.updatePassword(id, hash),
+        revokeAllRefreshTokens: (id) => this.refreshTokens.revokeAllForUser(id),
+      });
+    } catch (error) {
+      token.usedAt = null;
+      throw error;
+    }
+    return true;
+  }
+  activeFor(userId: string) {
+    return this.tokens.filter((t) => t.userId === userId && !t.usedAt).length;
+  }
+}
+
+/** Fake limiter driven by a manual clock; same sliding-window rules as the real adapter. */
+export class FakeAttemptLimiter implements AttemptLimiter {
+  private readonly attempts = new Map<string, number[]>();
+  constructor(private readonly now: () => number) {}
+  retryAfter(key: string, max: number, windowSeconds: number) {
+    const live = this.live(key, windowSeconds);
+    if (live.length < max) return 0;
+    return Math.max(
+      1,
+      Math.ceil((live[live.length - max]! + windowSeconds * 1000 - this.now()) / 1000),
+    );
+  }
+  record(key: string, windowSeconds: number) {
+    this.attempts.set(key, [...this.live(key, windowSeconds), this.now()]);
+  }
+  reset(key: string) {
+    this.attempts.delete(key);
+  }
+  private live(key: string, windowSeconds: number) {
+    const limit = this.now() - windowSeconds * 1000;
+    return (this.attempts.get(key) ?? []).filter((at) => at > limit);
   }
 }
